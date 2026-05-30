@@ -1,16 +1,38 @@
 {
   "name": "movicom",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Give an AI agent a body on a phone — drive a real Android over adb, reading the screen as cheap structured text instead of screenshots.",
   "main": "movicom.js",
-  "bin": { "movicom": "movicom.js" },
+  "bin": {
+    "movicom": "movicom.js"
+  },
   "scripts": {
     "see": "node movicom.js see"
   },
-  "keywords": ["android", "adb", "agent", "llm", "automation", "ai", "uiautomator", "mobile"],
+  "keywords": [
+    "android",
+    "adb",
+    "agent",
+    "llm",
+    "automation",
+    "ai",
+    "uiautomator",
+    "mobile"
+  ],
   "author": "Andy Cufari",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/andycufari/movicom.git" },
-  "engines": { "node": ">=14" },
-  "dependencies": {}
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andycufari/movicom.git"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "dependencies": {},
+  "files": [
+    "movicom.js",
+    "README.md",
+    "AGENTS.md",
+    "LICENSE"
+  ]
 }

@@ -5,11 +5,22 @@ lets an LLM *see* and *use* a real Android device over `adb` — reading the scr
 structured text (cheap) instead of screenshots (expensive), and acting by **name**
 instead of pixel coordinates.
 
-```js
-const phone = require('./movicom');
-phone.open('Settings').tap('Network & internet').see();
-// → {"app":"settings","tap":["Wi-Fi","Mobile network",...],"scroll":true}
+```bash
+movicom app open settings
+movicom ui see
+# → {"app":"settings","tap":["Wi-Fi","Apps","Notifications",...],"scroll":true}
 ```
+
+It even has **workflows** — save a sequence once, replay it forever, share it across
+agents:
+
+```bash
+movicom workflow add morning '["app open gmail","ui see","notif list","app open home"]'
+movicom workflow run morning
+```
+
+**Building an agent on movicom? Read [AGENTS.md](AGENTS.md)** — the operating manual
+written for LLMs.
 
 Named after [Movicom](https://en.wikipedia.org/wiki/Movicom), the pioneering
 Argentine cellular company — a local telecom ghost reborn as an agent's hands.

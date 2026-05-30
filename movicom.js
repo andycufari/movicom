@@ -179,7 +179,13 @@ class Phone {
     let scroll = false;
     for (const e of this._els) {
       if (e.scrollable) scroll = true;
-      if (e.editable) { if (e.label || true) type.push(coordize(e, coords)); continue; }
+      if (e.editable) {
+        // editable fields may HOLD a value — surface it in read[] so the agent can
+        // READ it, not just know it's typeable. (scar 2026-05-30: values invisible.)
+        if (e.label) read.push(e.label);
+        type.push(coordize(e, coords));
+        continue;
+      }
       if (e.clickable && e.label) { tap.push(coordize(e, coords)); continue; }
       if (e.label) read.push(e.label);
     }
@@ -266,16 +272,79 @@ class Phone {
   }
   nextPage() { return this.scroll('down'); }
 
+  // Open an app by PACKAGE via `monkey` — deterministic, no fragile gestures, never
+  // depends on an icon being on a visible page. Also the reliable way to RESET
+  // position when lost. (scar 2026-05-30: gesture+icon-tap got lost in the shade.)
   open(app) {
-    // try launcher by name from home; fall back to monkey by guessed pkg
-    this.home(); sleep(600); this._silentSee();
-    const e = this._find(app);
-    if (e) { adbShell(`input tap ${e.bounds.cx} ${e.bounds.cy}`); sleep(1500); this._els = []; return this; }
-    // not on first home page — try app drawer swipe up then search
-    this.scroll('up'); sleep(600); this._silentSee();
-    const e2 = this._find(app);
-    if (e2) { adbShell(`input tap ${e2.bounds.cx} ${e2.bounds.cy}`); sleep(1500); this._els = []; return this; }
-    console.log(JSON.stringify({ error: `couldn't find app "${app}" on home/drawer` }));
+    // "home" has no launchable activity — it's the HOME key.
+    if (/^home$/i.test(String(app).trim())) {
+      this.home(); sleep(800);
+      console.log(JSON.stringify({ opened: 'home' }));
+      return this;
+    }
+    const pkg = this._resolvePackage(app);
+    if (!pkg) {
+      console.log(JSON.stringify({ error: `no installed app matches "${app}"`, hint: 'try `movicom app list`' }));
+      return this;
+    }
+    try {
+      const r = adbShell(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
+      sleep(1600); this._els = [];
+      if (/No activities found|aborted/i.test(r)) {
+        console.log(JSON.stringify({ error: `"${app}" (${pkg}) has no launchable activity` }));
+      } else {
+        console.log(JSON.stringify({ opened: app, pkg }));
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ error: `failed to open "${app}": ${e.message || e}` }));
+    }
+    return this;
+  }
+
+  // friendly name -> package: alias table first, then search installed packages.
+  _resolvePackage(app) {
+    const n = String(app).toLowerCase().trim();
+    const alias = {
+      settings: 'com.android.settings',
+      chrome: 'com.android.chrome', browser: 'com.android.chrome',
+      gmail: 'com.google.android.gm', mail: 'com.google.android.gm',
+      whatsapp: 'com.whatsapp',
+      messages: 'com.google.android.apps.messaging', sms: 'com.google.android.apps.messaging',
+      phone: 'com.google.android.dialer', dialer: 'com.google.android.dialer',
+      contacts: 'com.google.android.contacts',
+      photos: 'com.google.android.apps.photos',
+      youtube: 'com.google.android.youtube',
+      maps: 'com.google.android.apps.maps',
+      calendar: 'com.google.android.calendar',
+      clock: 'com.google.android.deskclock', alarm: 'com.google.android.deskclock',
+      camera: 'com.android.camera2',
+      'play store': 'com.android.vending', play: 'com.android.vending', store: 'com.android.vending',
+    };
+    if (alias[n]) return alias[n];
+    try {
+      const pkgs = adbShell('pm list packages').split('\n')
+        .map((l) => l.replace('package:', '').trim()).filter(Boolean);
+      const tok = n.replace(/\s+/g, '');
+      return pkgs.find((p) => p.split('.').pop().toLowerCase() === tok)
+        || pkgs.find((p) => p.toLowerCase().includes(tok))
+        || null;
+    } catch (_) { return null; }
+  }
+
+  // list launchable apps (name + package), parsed from the launcher resolver.
+  appList() {
+    let out = '';
+    try {
+      out = adbShell('cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER');
+    } catch (_) {}
+    const pkgs = [...new Set(
+      (out.match(/^[\s]*([a-z][a-z0-9_.]+)\/[A-Za-z0-9_.$]+/gm) || [])
+        .map((l) => l.trim().split('/')[0])
+        .filter((p) => p.split('.').length >= 2)
+    )];
+    const apps = pkgs.map((p) => ({ name: shortApp(p), pkg: p }))
+                     .sort((a, b) => a.name.localeCompare(b.name));
+    console.log(JSON.stringify(apps));
     return this;
   }
 
@@ -451,7 +520,7 @@ const ROUTER = {
     list: () => phone.notifications(),
   },
   app: {
-    list: () => phone.appList ? phone.appList() : out({ error: 'app list: not yet implemented' }),
+    list: () => phone.appList(),
     open: (a) => phone.open(typeof a === 'string' ? a : (a && a.name)),
     intent: (a) => phone.intent((a && a.action) || a, (a && a.extra) || ''),
   },
@@ -467,6 +536,40 @@ const ROUTER = {
     back:   () => phone.back(),
     home:   () => phone.home(),
   },
+  // ---- workflows: named, saved, replayable command sequences ----
+  // A workflow is an array of command strings stored in ~/.movicom/workflows.json,
+  // shareable across agents. Turns movicom from a remote control into a programmable body.
+  workflow: {
+    list: () => out(Object.entries(loadWorkflows()).map(([name, steps]) => ({ name, steps: steps.length }))),
+    show: (a) => { const w = loadWorkflows(); const n = typeof a === 'string' ? a : a && a.name; out(w[n] ? { name: n, steps: w[n] } : { error: `no workflow "${n}"` }); },
+    add: (a) => {
+      let name, steps;
+      if (a && typeof a === 'object' && !Array.isArray(a)) { name = a.name; steps = a.steps; }
+      else if (typeof a === 'string') {
+        const sp = a.indexOf(' ');
+        name = sp === -1 ? a : a.slice(0, sp);
+        const rest = sp === -1 ? '' : a.slice(sp + 1).trim();
+        try { steps = JSON.parse(rest); } catch (_) { steps = rest ? rest.split(';').map((s) => s.trim()).filter(Boolean) : []; }
+      }
+      if (!name || !Array.isArray(steps) || !steps.length) {
+        return out({ error: 'usage: workflow add <name> \'["cmd","cmd"]\'  (or json {name,steps})' });
+      }
+      const w = loadWorkflows(); w[name] = steps; saveWorkflows(w);
+      out({ saved: name, steps });
+    },
+    del: (a) => { const n = typeof a === 'string' ? a : a && a.name; const w = loadWorkflows(); if (!w[n]) return out({ error: `no workflow "${n}"` }); delete w[n]; saveWorkflows(w); out({ deleted: n }); },
+    run: (a) => {
+      const n = typeof a === 'string' ? a : a && a.name;
+      const w = loadWorkflows();
+      if (!w[n]) return out({ error: `no workflow "${n}"`, available: Object.keys(w) });
+      const results = [];
+      for (const step of w[n]) {
+        const captured = capture(() => dispatch(tokenize(step)));
+        results.push({ step, result: tryParse(captured) });
+      }
+      out({ workflow: n, results });
+    },
+  },
   // ---- meta ----
   devices: () => { try { out({ devices: sh(`${ADB} devices`).split('\n').slice(1).map((l) => l.split('\t')[0]).filter(Boolean) }); } catch (e) { out({ error: String(e.message || e) }); } },
   doctor:  () => {
@@ -479,14 +582,57 @@ const ROUTER = {
   },
 };
 
+// ---- workflow storage + helpers ------------------------------------------
+const _os = require('os');
+const _path = require('path');
+const _fs = require('fs');
+const WF_DIR = _path.join(_os.homedir(), '.movicom');
+const WF_FILE = _path.join(WF_DIR, 'workflows.json');
+function loadWorkflows() {
+  try { return JSON.parse(_fs.readFileSync(WF_FILE, 'utf8')); } catch (_) { return {}; }
+}
+function saveWorkflows(w) {
+  try { _fs.mkdirSync(WF_DIR, { recursive: true }); _fs.writeFileSync(WF_FILE, JSON.stringify(w, null, 2)); } catch (_) {}
+}
+// split a command string into argv, respecting quotes and JSON braces so
+// `app open Play Store`, `ui tap "No thanks"`, `contacts add {"x":1}` all work.
+function tokenize(str) {
+  const toks = []; let i = 0; const s = String(str).trim();
+  while (i < s.length) {
+    while (s[i] === ' ') i++;
+    if (i >= s.length) break;
+    let tok = '';
+    if (s[i] === '"' || s[i] === "'") { const q = s[i++]; while (i < s.length && s[i] !== q) tok += s[i++]; i++; }
+    else if (s[i] === '{' || s[i] === '[') { tok = s.slice(i); i = s.length; }
+    else { while (i < s.length && s[i] !== ' ') tok += s[i++]; }
+    toks.push(tok);
+  }
+  return toks;
+}
+function capture(fn) {
+  const orig = console.log; let buf = '';
+  console.log = (...a) => { buf += a.join(' ') + '\n'; };
+  try { fn(); } finally { console.log = orig; }
+  return buf.trim();
+}
+function tryParse(s) { try { return JSON.parse(s); } catch (_) { return s; } }
+
 function dispatch(argv) {
   if (!argv.length || argv[0] === 'help' || argv[0] === '--help') {
     return out({
       usage: 'movicom <noun> <verb> [json-or-args]',
       system: ['contacts list|find|add', 'sms list|send|read', 'call dial|log', 'notif list', 'app list|open|intent'],
       ui: ['ui see|tap|type|key|scroll|fill|shot|back|home'],
+      workflow: ['workflow list|show|add|run|del — saved replayable command sequences'],
       meta: ['devices', 'doctor'],
-      notes: 'writes take JSON; reads take plain args; output is always JSON.',
+      notes: 'writes take JSON; reads take plain args; output is always JSON. See AGENTS.md.',
+      examples: [
+        'movicom app open gmail',
+        'movicom ui see',
+        'movicom contacts add \'{"first":"Ada","phone":"+5491100000000"}\'',
+        'movicom workflow add morning \'["app open gmail","ui see","notif list"]\'',
+        'movicom workflow run morning',
+      ],
     });
   }
   const [noun, verb, ...rest] = argv;
