@@ -349,6 +349,22 @@ class Phone {
     return this;
   }
 
+  // dial a number. GATED: dialing is an outbound action — it must pass the
+  // approval brake before it can actually place a call. For now it only composes
+  // the dialer (ACTION_DIAL, does NOT call) and returns gated:true so the CLI
+  // surfaces that the real CALL path is not wired yet. ("handle later with a hack
+  // in between" — Andy, 2026-05-30.)
+  call(number) {
+    if (!number) { console.log(JSON.stringify({ error: 'call: no number' })); return this; }
+    // ACTION_DIAL only fills the dialer; it never auto-places the call.
+    adbShell(`am start -a android.intent.action.DIAL -d tel:${String(number).replace(/[^\d+]/g, '')}`);
+    sleep(1200);
+    this._els = [];
+    console.log(JSON.stringify({ gated: true, action: 'composed-dialer', number,
+      note: 'real CALL is gated behind the approval brake — not placed' }));
+    return this;
+  }
+
   // read contacts straight from the provider — no UI, no scrolling, no screenshot.
   contacts(filter = '') {
     const out = adbShell('content query --uri content://com.android.contacts/data/phones ' +
@@ -397,20 +413,92 @@ function shortApp(pkg) {
   return map[pkg] || pkg.split('.').pop();
 }
 
-// ---- CLI: `node phone.js see` or chained: `open Settings : tap Apps : see`
 const phone = new Phone();
 module.exports = phone;
 
-if (require.main === module) {
-  const argv = process.argv.slice(2);
-  if (!argv.length) { phone.see(); process.exit(0); }
-  // split on ":" into chained calls
-  const groups = [];
-  let g = [];
-  for (const a of argv) { if (a === ':') { groups.push(g); g = []; } else g.push(a); }
-  if (g.length) groups.push(g);
-  for (const [verb, ...args] of groups) {
-    if (typeof phone[verb] === 'function') phone[verb](...args);
-    else console.log(JSON.stringify({ error: `unknown verb "${verb}"` }));
+// ---- CLI grammar: `movicom <noun> <verb> [json-or-plain-args]` ------------
+// Convention (locked with Andy 2026-05-30):
+//   * writes take a JSON object:   contacts add '{"first":"Ada","phone":"+54..."}'
+//   * reads / single args stay plain:  contacts find Andy   |   call dial 54911...
+//   * EVERY command prints exactly one JSON value to stdout (agent-first).
+// The router maps nouns to the engine methods that already exist + are tested.
+function out(v) { console.log(JSON.stringify(v)); }
+function parseArg(a) { // JSON object if it looks like one, else the raw string
+  if (a == null) return undefined;
+  const s = String(a).trim();
+  if (s.startsWith('{') || s.startsWith('[')) { try { return JSON.parse(s); } catch (_) {} }
+  return s;
+}
+
+const ROUTER = {
+  // ---- system lane: talk to the OS, not the glass ----
+  contacts: {
+    list: (a) => phone.contacts(typeof a === 'string' ? a : ''),
+    find: (a) => phone.contacts(typeof a === 'string' ? a : (a && a.q) || ''),
+    add:  (a) => phone.addContact(a || {}),
+    // del intentionally omitted from v0.1 router until guarded (see brakes)
+  },
+  sms: {
+    list: (a) => phone.smsList ? phone.smsList(a) : out({ error: 'sms list: not yet implemented' }),
+    send: (a) => out({ error: 'sms send is gated — wire the approval brake first', got: a }),
+    read: (a) => phone.smsRead ? phone.smsRead(a) : out({ error: 'sms read: not yet implemented' }),
+  },
+  call: {
+    dial: (a) => phone.call(typeof a === 'string' ? a : (a && a.number)), // gated stub
+    log:  () => phone.callLog ? phone.callLog() : out({ error: 'call log: not yet implemented' }),
+  },
+  notif: {
+    list: () => phone.notifications(),
+  },
+  app: {
+    list: () => phone.appList ? phone.appList() : out({ error: 'app list: not yet implemented' }),
+    open: (a) => phone.open(typeof a === 'string' ? a : (a && a.name)),
+    intent: (a) => phone.intent((a && a.action) || a, (a && a.extra) || ''),
+  },
+  // ---- UI lane: drive the glass (third-party apps with no back door) ----
+  ui: {
+    see:    (a) => phone.see(typeof a === 'object' ? a : {}),
+    tap:    (a) => phone.tap(typeof a === 'string' ? a : (a && a.label)),
+    type:   (a) => phone.type(typeof a === 'string' ? a : (a && a.text)),
+    key:    (a) => phone.key(typeof a === 'string' ? a : (a && a.key)),
+    scroll: (a) => phone.scroll(typeof a === 'string' ? a : (a && a.dir) || 'down'),
+    fill:   (a) => phone.fill(a || {}),
+    shot:   (a) => phone.shot(typeof a === 'string' ? a : undefined),
+    back:   () => phone.back(),
+    home:   () => phone.home(),
+  },
+  // ---- meta ----
+  devices: () => { try { out({ devices: sh(`${ADB} devices`).split('\n').slice(1).map((l) => l.split('\t')[0]).filter(Boolean) }); } catch (e) { out({ error: String(e.message || e) }); } },
+  doctor:  () => {
+    const r = {};
+    try { r.adb = (sh(`${ADB} version`).match(/version\s+([\d.]+)/i) || [])[1]; } catch (_) { r.adb = null; }
+    r.adbValidated = ADB_VALIDATED;
+    try { r.device = sh(`${ADB} devices`).split('\n')[1]?.split('\t')[0] || null; } catch (_) { r.device = null; }
+    try { r.focus = (adbShell('dumpsys window').match(/mCurrentFocus=Window\{[^ ]+ \w+ ([^}]+)\}/) || [])[1] || null; } catch (_) { r.focus = null; }
+    out(r);
+  },
+};
+
+function dispatch(argv) {
+  if (!argv.length || argv[0] === 'help' || argv[0] === '--help') {
+    return out({
+      usage: 'movicom <noun> <verb> [json-or-args]',
+      system: ['contacts list|find|add', 'sms list|send|read', 'call dial|log', 'notif list', 'app list|open|intent'],
+      ui: ['ui see|tap|type|key|scroll|fill|shot|back|home'],
+      meta: ['devices', 'doctor'],
+      notes: 'writes take JSON; reads take plain args; output is always JSON.',
+    });
   }
+  const [noun, verb, ...rest] = argv;
+  const node = ROUTER[noun];
+  if (!node) return out({ error: `unknown noun "${noun}"`, hint: 'try: movicom help' });
+  if (typeof node === 'function') return node(parseArg(verb)); // meta nouns: devices/doctor
+  const fn = node[verb];
+  if (!fn) return out({ error: `unknown verb "${verb}" for "${noun}"`, available: Object.keys(node) });
+  return fn(parseArg(rest.join(' ')));
+}
+
+if (require.main === module) {
+  try { dispatch(process.argv.slice(2)); }
+  catch (e) { out({ error: String(e && e.message || e) }); process.exit(1); }
 }
