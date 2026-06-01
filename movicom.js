@@ -167,21 +167,22 @@ class Phone {
     throw new Error('phone.see: could not get a UI dump (no focused window?)');
   }
 
-  // ---- the optic nerve: returns MEANING, prints minified, stays chainable
-  see({ coords = false, raw = false } = {}) {
+  // ---- the optic nerve: build the MEANING view (dump → parse → minify).
+  // _view() RETURNS the object (no printing) so every ACTION can fold a fresh
+  // screen read into its own result — act→see in one round-trip, the #1 token win
+  // (Andy's idea, 2026-05-31): the model never needs a separate `see` to learn
+  // what its tap did. `readCap` lets content-heavy screens (a news article) widen
+  // the text beyond the default 12-item noise cap.
+  _view({ coords = false, readCap = 12 } = {}) {
     const xml = this._dump();
     this._els = parseScreen(xml);
     this._app = foregroundApp();
-
-    if (raw) { console.log(xml); return this; }
 
     const tap = [], type = [], read = [];
     let scroll = false;
     for (const e of this._els) {
       if (e.scrollable) scroll = true;
       if (e.editable) {
-        // editable fields may HOLD a value — surface it in read[] so the agent can
-        // READ it, not just know it's typeable. (scar 2026-05-30: values invisible.)
         if (e.label) read.push(e.label);
         type.push(coordize(e, coords));
         continue;
@@ -189,20 +190,28 @@ class Phone {
       if (e.clickable && e.label) { tap.push(coordize(e, coords)); continue; }
       if (e.label) read.push(e.label);
     }
-    const view = {
+    return {
       app: shortApp(this._app.pkg),
       tap: dedupe(tap),
       type: dedupe(type),
-      read: dedupe(read).slice(0, 12), // cap the non-interactive text noise
+      read: dedupe(read).slice(0, readCap),
       scroll,
     };
-    console.log(JSON.stringify(view));
+  }
+
+  see({ coords = false, raw = false, readCap = 12 } = {}) {
+    if (raw) { const xml = this._dump(); console.log(xml); return this; }
+    console.log(JSON.stringify(this._view({ coords, readCap })));
     return this;
   }
 
   // ---- act by NAME; tool resolves to coords --------------------------------
+  // ALWAYS resolve against a FRESH dump. Coordinates move out from under us when
+  // the soft keyboard opens/closes (Gmail's Subject shifted ~436px between dumps,
+  // 2026-05-31) — resolving against cached `_els` taps where the element USED to
+  // be (scar: "tap Subject" opened the camera). Fresh dump every time is the fix.
   _find(name) {
-    if (!this._els.length) this._silentSee();
+    this._silentSee();
     const n = name.toLowerCase();
     // exact label, then contains
     return (
@@ -216,13 +225,22 @@ class Phone {
     this._app = foregroundApp();
   }
 
+  // Every action returns {<what it did>, screen:<fresh view>} — act→see folded
+  // into ONE call so the model sees the result of its action without a separate
+  // `see` (halves the round-trips; the biggest token + reasoning win).
+  _act(result) {
+    sleep(300);                 // small settle so the new screen has rendered
+    this._els = [];
+    console.log(JSON.stringify({ ...result, screen: this._view() }));
+    return this;
+  }
+
   tap(name) {
-    const e = this._find(name);
-    if (!e) { console.log(JSON.stringify({ error: `no element matching "${name}"` })); return this; }
+    const e = this._find(name); // fresh dump inside _find
+    if (!e) { console.log(JSON.stringify({ error: `no element matching "${name}"`, screen: this._view() })); return this; }
     adbShell(`input tap ${e.bounds.cx} ${e.bounds.cy}`);
     sleep(900);
-    this._els = []; // screen likely changed; force re-see on next find
-    return this;
+    return this._act({ tapped: name });
   }
 
   // `input text` is ASYNC on the device — adb returns before the keystrokes land.
@@ -234,7 +252,7 @@ class Phone {
     const esc = String(text).replace(/(["'\\ ])/g, '\\$1').replace(/ /g, '%s');
     adbShell(`input text "${esc}"`);
     this._settle();
-    return this;
+    return this._act({ typed: text });
   }
 
   // wait until the device's IME/input has quiesced: poll a cheap signal until it
@@ -255,19 +273,22 @@ class Phone {
     const code = name.startsWith('KEYCODE_') ? name : 'KEYCODE_' + name.toUpperCase();
     adbShell(`input keyevent ${code}`);
     sleep(500);
-    this._els = [];
-    return this;
+    return this._act({ key: name });
   }
 
   back() { return this.key('BACK'); }
   home() { return this.key('HOME'); }
 
+  // scroll folds the post-scroll screen into its result with a WIDER read cap —
+  // reading long content (a news article) is scroll→see→scroll→see, and the model
+  // wants the freshly-revealed TEXT each time, not just the chrome.
   scroll(dir = 'down') {
     const d = { down: '540 1600 540 600', up: '540 600 540 1600',
                 left: '900 1200 200 1200', right: '200 1200 900 1200' }[dir];
     adbShell(`input swipe ${d} 300`);
     sleep(700);
     this._els = [];
+    console.log(JSON.stringify({ scrolled: dir, screen: this._view({ readCap: 40 }) }));
     return this;
   }
   nextPage() { return this.scroll('down'); }
@@ -375,26 +396,39 @@ class Phone {
     return this;
   }
 
-  // robust multi-field form fill: tap → type → hide-IME → re-settle per field.
-  // pass {labelOrHint: value}. matches an EditText by its hint/text, taps its
-  // SETTLED center (keyboard hidden), types, hides keyboard, moves on. This is
-  // the scar-hardened path; the soft keyboard shifts layout, so we re-see between
-  // fields instead of trusting stale coordinates.
+  // robust multi-field form fill (scars 2026-05-31, Gmail compose). Pass
+  // {labelOrHint: value}. Per field: resolve from a FRESH dump (keyboard shifts
+  // the layout ~436px), tap to FOCUS it (type() types into whatever is focused —
+  // skip the focus and every field piles into the previous one, e.g. recipient+
+  // subject+body all landing in "To"), then type. We do NOT send ESCAPE between
+  // fields: in some apps (Gmail) it dismisses the whole compose.
   fill(fields) {
+    const filled = [];
     for (const [name, value] of Object.entries(fields)) {
-      this.key('ESCAPE');            // ensure keyboard down before reading layout
-      this._silentSee();
-      const e = this._els.find(
-        (x) => x.editable &&
-          ((x.label || '').toLowerCase().includes(name.toLowerCase())));
-      if (!e) { console.log(JSON.stringify({ error: `no field matching "${name}"` })); continue; }
-      adbShell(`input tap ${e.bounds.cx} ${e.bounds.cy}`);
-      sleep(700);
-      this.type(value);
-      this.key('ESCAPE');
-      sleep(400);
+      const e = this._findField(name); // fresh dump inside
+      if (!e) { filled.push({ field: name, error: 'not found' }); continue; }
+      adbShell(`input tap ${e.bounds.cx} ${e.bounds.cy}`); // FOCUS the field
+      sleep(500);
+      adbShell(`input text "${String(value).replace(/(["'\\ ])/g, '\\$1').replace(/ /g, '%s')}"`);
+      this._settle();
+      this._els = [];                                       // layout shifted
+      filled.push({ field: name, value });
     }
+    console.log(JSON.stringify({ filled, screen: this._view() }));
     return this;
+  }
+
+  // like _find but prefers EditText fields — a form field's "label" is often its
+  // hint text living IN the EditText (e.g. text="Subject"). Fresh dump each call.
+  _findField(name) {
+    this._silentSee();
+    const n = name.toLowerCase();
+    return (
+      this._els.find((e) => e.editable && e.label.toLowerCase() === n) ||
+      this._els.find((e) => e.editable && e.label.toLowerCase().includes(n)) ||
+      this._els.find((e) => e.label.toLowerCase() === n) ||
+      this._els.find((e) => e.label.toLowerCase().includes(n))
+    );
   }
 
   // write a contact straight to the provider — NO typing, NO drift. The lesson
@@ -578,7 +612,32 @@ const ROUTER = {
     r.adbValidated = ADB_VALIDATED;
     try { r.device = sh(`${ADB} devices`).split('\n')[1]?.split('\t')[0] || null; } catch (_) { r.device = null; }
     try { r.focus = (adbShell('dumpsys window').match(/mCurrentFocus=Window\{[^ ]+ \w+ ([^}]+)\}/) || [])[1] || null; } catch (_) { r.focus = null; }
+    try { r.softKeyboard = adbShell('ime list -s').trim() ? 'on' : 'off'; } catch (_) {}
     out(r);
+  },
+  // kbd off|on — RECOMMENDED (not required) accuracy setting. The soft keyboard is
+  // movicom's #1 enemy: opening it shifts the layout ~436px (stale-coord taps),
+  // collapses fields out of the view tree, and triggers autocomplete dropdowns
+  // that eat the layout. `input text` injects BELOW the IME, so typing still works
+  // with the soft keyboard DISABLED — but the layout stays rock-still, so multi-
+  // field forms (email, etc.) fill reliably even on a small model. Turn it back on
+  // when a human needs the phone. (scar+fix 2026-05-31, Andy's idea.)
+  kbd: (a) => {
+    const want = (typeof a === 'string' ? a : (a && a.state) || '').toLowerCase();
+    try {
+      const imes = adbShell('ime list -s').split('\n').map(s => s.trim()).filter(Boolean);
+      if (want === 'off') {
+        for (const id of imes) { try { adbShell(`ime disable ${id}`); } catch (_) {} }
+        out({ softKeyboard: 'off', note: 'layout will stay stable; `input text` still types. Re-enable with `movicom kbd on`.' });
+      } else if (want === 'on') {
+        // re-enable the standard Latin/Gboard IME and make it active
+        const latin = 'com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME';
+        try { adbShell(`ime enable ${latin}`); adbShell(`ime set ${latin}`); } catch (_) {}
+        out({ softKeyboard: 'on', restored: latin });
+      } else {
+        out({ error: 'usage: movicom kbd off | movicom kbd on', current: imes.length ? 'on' : 'off' });
+      }
+    } catch (e) { out({ error: String(e.message || e) }); }
   },
 };
 
