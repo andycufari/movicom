@@ -1,26 +1,27 @@
 # movicom
 
 **Give an AI agent a body on a phone.** A tiny, dependency-free Node.js driver that
-lets an LLM *see* and *use* a real Android device over `adb` — reading the screen as
-structured text (cheap) instead of screenshots (expensive), and acting by **name**
-instead of pixel coordinates.
+lets *any* LLM *see* and *use* a real Android device over `adb` — reading the screen
+as a **menu designed for the model** (cheap) instead of screenshots (expensive), and
+acting by **name** instead of pixel coordinates. Light enough that a small **9B
+local model** can drive it.
 
 ```bash
-movicom app open settings
+movicom web search "world cup 2026 first match"
 movicom ui see
-# → {"app":"settings","tap":["Wi-Fi","Apps","Notifications",...],"scroll":true}
+# → {"where":"chrome",
+#    "text":["The 2026 World Cup opens Thu June 11, 2026 — Mexico vs South Africa,
+#             Estadio Azteca, Mexico City"],
+#    "actions":["Images","Maps","News"], "fields":["Search"],
+#    "can_scroll":true, "page":"1/8",
+#    "hint":"tap an action: ui tap \"Images\"  |  more actions: ui more"}
 ```
 
-It even has **workflows** — save a sequence once, replay it forever, share it across
-agents:
+No screenshot. No API. No browser extension. movicom read the answer off the phone
+as text — the way a person would.
 
-```bash
-movicom workflow add morning '["app open gmail","ui see","notif list","app open home"]'
-movicom workflow run morning
-```
-
-**Building an agent on movicom? Read [AGENTS.md](AGENTS.md)** — the operating manual
-written for LLMs.
+**Building an agent on movicom? Read [AGENTS.md](AGENTS.md)** (the operating manual
+for LLMs) and **[HOWTO.md](HOWTO.md)** (set up adb + a phone in minutes).
 
 Named after [Movicom](https://en.wikipedia.org/wiki/Movicom), the pioneering
 Argentine cellular company — a local telecom ghost reborn as an agent's hands.
@@ -30,20 +31,33 @@ Argentine cellular company — a local telecom ghost reborn as an agent's hands.
 ## Why
 
 Most "let an agent use a phone" setups send a **screenshot** to a vision model on
-every step. That's slow and burns tokens — a single screen is ~150–500 KB of image.
+every step — slow, and it burns real tokens (and dollars) per image.
 
-movicom takes a different path: it reads Android's own UI tree (`uiautomator dump`)
-and hands the agent only the **meaning** — the labels you can tap, the fields you can
-type into, whether the screen scrolls. A whole home screen is ~230 bytes of JSON.
+movicom reads Android's own UI tree (`uiautomator dump`) and hands the agent a
+**menu** — `where` it is, the `actions` it can tap, the `fields` it can fill, the
+visible `text`, and a `hint` of what to do next. The model *picks from a menu* like a
+human browses a UI; it never reasons about pixels.
 
 | Approach | Cost per screen | Agent reasons about |
 |---|---|---|
-| Screenshot → vision | ~150–500 KB | pixels |
-| **movicom `see()`** | **~0.2–0.5 KB** | **labels & structure** |
+| Screenshot → vision | ~1,000–1,500 tok + $ per image | pixels |
+| **movicom menu** | **~200–400 tok, no image $** | **labels & structure** |
 
-The agent thinks in names (`tap("Settings")`); movicom keeps the coordinates to
-itself and resolves the name to a tap. Screenshots remain available as an explicit
-fallback (`shot()`) for the rare screen with no text (captchas, canvases, images).
+This is the **AI Interface / AI Experience (AII/AIX)**: the output isn't a raw dump,
+it's an interface *designed for an AI to use*. Cluttered pages are paginated
+(`page:"1/8"`, `ui more`) so a noisy screen stays cheap — a Google results page went
+from ~1,350 tokens to ~270 with no loss of reach. Screenshots remain an explicit
+fallback (`shot()`, plus `camera shot` to take a real photo) for the rare screen
+with no text.
+
+### Why a phone, not an API?
+
+Because **most of what a person does on a phone has no API** — your Instagram feed,
+a Rappi order, a logged-in dashboard, an app whose API got killed or gated. The
+*screen* is always there; it's the one surface that can't be walled off without
+walling off the user. movicom drives it as **you**, on **your** device, with **your**
+accounts — for your own work. (When a clean API exists — e.g. weather — use it;
+movicom is for the 99% that doesn't.)
 
 ## Design
 
@@ -76,86 +90,61 @@ the emulator.
 
 ## Usage
 
-**CLI** — chain verbs with `:` :
+Grammar: `movicom <noun> <verb> [arg|json]`. Every command prints **one JSON value**.
 
 ```bash
-node movicom.js see
-node movicom.js open Settings : tap "Apps" : see
-node movicom.js notifications
-node movicom.js home
-```
-
-**As a module** — fluent and chainable:
-
-```js
-const phone = require('./movicom');
-
-phone.open('Settings')
-     .tap('Network & internet')
-     .see();
-
-// type into a form robustly (handles the soft-keyboard layout shift)
-phone.fill({ 'First name': 'Ada', 'Last name': 'Lovelace' });
-
-// prefer intents / providers over UI mazes when an app exposes them
-phone.intent('android.intent.action.INSERT', '-t vnd.android.cursor.dir/contact');
-phone.addContact({ first: 'Ada', last: 'Lovelace', phone: '+5491100000000' });
+movicom doctor                       # where am I? device + foreground app
+movicom web search "best ramen near me"   # reach the web (don't fumble the omnibox)
+movicom app open gmail               # launch an app by name
+movicom ui see                       # read the screen as a menu
+movicom ui tap "Compose"             # act by NAME (movicom holds the coords)
+movicom ui fill '{"Subject":"Hi","Compose email":"the body"}'
+movicom ui more                      # next page of actions on a busy screen
+movicom camera shot '{"pull":true}'  # take a real photo, copy it to the computer
 ```
 
 ### Verbs
 
 | Verb | What it does |
 |---|---|
-| `see({coords, raw})` | Print the screen as minified JSON: `{app, tap[], type[], read[], scroll}`. `coords:true` includes tap points; `raw:true` dumps the source XML (debugging). |
-| `tap(name)` | Tap the element whose label exactly/loosely matches `name`. |
-| `type(text)` | Type into the focused field. |
-| `key(name)` / `back()` / `home()` | Send a key event (`BACK`, `HOME`, `ENTER`, `TAB`, `ESCAPE`, …). |
-| `scroll(dir)` / `nextPage()` | Swipe `down`/`up`/`left`/`right`. |
-| `open(app)` | Launch an app by its launcher name. |
-| `intent(action, extra)` | Fire an Android intent (often more reliable than tapping through menus). |
-| `fill({label: value})` | Fill a multi-field form, hardened against keyboard layout shift. |
-| `addContact({first, last, phone})` | Write a contact straight to the content provider (no typing). |
-| `notifications()` | Read the notification shade as text — let the phone *summon* the agent. |
-| `shot(file)` | Low-res screenshot — explicit fallback for text-less screens. |
+| `doctor` / `devices` | Device + foreground app / list adb devices. Start here. |
+| `web open <url>` · `web go <domain>` · `web search <query>` | Reach the internet deterministically via an intent — no address-bar fumbling. |
+| `app list` · `app open <name>` · `app intent '{...}'` | List / launch apps; fire a raw intent. |
+| `ui see [page#]` | Read the screen as a menu: `{where, actions[], fields[], text[], can_scroll, page, hint}`. |
+| `ui more` | Next page of actions (busy screens are paginated to stay cheap). |
+| `ui tap "<label>"` | Tap the element matching `label` (resolves across all pages). |
+| `ui type "<text>"` · `ui fill '{field: value}'` | Type into the focused field / fill a multi-field form (focuses each field first). |
+| `ui key <BACK\|HOME\|ENTER\|…>` · `ui scroll <dir>` · `ui back` · `ui home` | Keys, swipes, navigation. |
+| `kbd off` / `kbd on` | Disable/enable the soft keyboard — stops layout shift so forms fill reliably. |
+| `contacts list\|find\|add` · `notif list` | System lane: talk to the OS, not the glass. |
+| `camera shot '{"pull":true}'` | Take a real photo; `pull` copies it back so a multimodal model can SEE it. |
+| `ui shot [file]` | Low-res screenshot — explicit fallback for text-less screens. |
+| `workflow add\|run\|list\|del` | Save & replay named command sequences (shareable macros). |
+
+Every **action** (`ui tap/type/key/scroll/fill`) returns `{<result>, screen:{...}}` —
+the fresh menu after the action — so the model doesn't need a separate `ui see`.
 
 ## Configuring the phone
 
-You need a device `adb` can reach. Easiest is the Android Studio emulator; a real
-phone works too.
+See **[HOWTO.md](HOWTO.md)** for the full setup: install `adb` + movicom (Mac &
+Windows), enable developer mode, and connect a phone over **USB**, **wireless**
+(Android 11+, no cable), or the **emulator**. Quick check:
 
-### Option A — Emulator (no hardware)
-
-1. Install [Android Studio](https://developer.android.com/studio).
-2. **Device Manager → Create Virtual Device** → pick a phone + a system image → Finish.
-3. Launch it (from Device Manager, or `~/Library/Android/sdk/emulator/emulator -avd <name>`).
-4. `adb devices` should list `emulator-5554`. Done — `adb` talks to it over loopback,
-   no cable.
-
-> Note: Google-Play-protected apps (e.g. WhatsApp) may refuse to run on a stock
-> emulator. Use a real device for those.
-
-### Option B — Real phone over USB
-
-1. **Enable Developer Options:** Settings → About phone → tap **Build number** 7×.
-2. **Settings → System → Developer options → USB debugging: ON.**
-3. Connect via a **data** USB cable (charge-only cables won't work) — ideally
-   straight into the computer, not through a hub.
-4. Set the USB mode to **File Transfer (MTP)** if prompted.
-5. On the phone, accept **"Allow USB debugging?"** for this computer (check *always
-   allow*).
-6. `adb devices` should now list your phone.
-
-For automation, also consider: **Stay awake while charging** (Developer options),
-and a numeric **PIN** lock rather than biometrics (a PIN can be entered via
-`input text`, a fingerprint cannot).
+```bash
+adb devices      # your device should be listed
+movicom doctor   # device + current foreground app
+```
 
 ## Status
 
-Early but real. Proven on an Android 16 emulator: navigating apps, reading screens,
-filling forms, and writing a contact end-to-end — all verified against ground truth
-(the content provider), not just the screen. Built in the open.
+Early but real, and dogfooded hard. Proven on an Android emulator + real Android:
+reading screens as a menu, filling multi-field forms, sending an email through the
+Gmail app, taking a photo, reading live web answers, writing a contact — all
+verified against ground truth (the MediaStore / content provider / a received
+email), not just the screen. It's UI-driven, so it can break when an app redesigns —
+that's the trade for reaching apps that have no API. Built in the open.
 
-Contributions welcome. Found a screen movicom mis-reads? Run `node movicom.js see raw`
+Contributions welcome. Found a screen movicom mis-reads? Run `movicom ui see --raw`
 on it and open an issue with the XML — the parser learns from real screens.
 
 ## License
