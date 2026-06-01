@@ -54,6 +54,9 @@ Opening is by package — it always lands. Never rely on swipe gestures to navig
 ### System lane (preferred — no UI race)
 - `contacts list [filter]` · `contacts find <q>` · `contacts add '{first,last,phone}'`
 - `notif list` — read the notification shade (your "what needs me?" sense)
+- `camera shot '{"pull":true}'` — take a real PHOTO in one call (opens camera,
+  clears permission dialogs, presses the shutter, returns the saved file path;
+  `pull:true` also copies it to the computer so a multimodal brain can SEE it)
 - `app list` — installed launchable apps (`[{name,pkg}]`)
 - `app open <name>` — launch by package; also the reliable position reset
 - `app intent '{"action":"...","extra":"-n pkg/activity"}'` — fire any intent

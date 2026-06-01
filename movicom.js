@@ -505,6 +505,71 @@ class Phone {
     console.log(JSON.stringify({ shot: file }));
     return this;
   }
+
+  // take a real PHOTO with the camera — one call instead of the open→permission→
+  // shutter→find-file dance. Opens the camera, taps the Shutter, then reads the
+  // newest image from the MediaStore (source of truth — the file may land in
+  // DCIM/ OR Pictures/ depending on the device, so we don't guess a folder).
+  // opts.pull: also copy the photo to the computer so a multimodal brain can SEE
+  // it. Returns { photo: <device path>, pulled?: <local path> }.
+  photo({ pull = false, dir = '/tmp' } = {}) {
+    // Track the newest image by the MAX _id (monotonic, indexed instantly) rather
+    // than date_added (second-granularity + lags the file write). We do NOT use a
+    // `--sort` flag: its quotes get mangled when the command is passed as one
+    // string through adbShell→execSync (scar 2026-06-01: `content` printed its
+    // usage banner). Instead we scan all rows and take the highest _id ourselves.
+    const newest = () => {
+      try {
+        const out = adbShell("content query --uri content://media/external/images/media " +
+          "--projection _id:_data");
+        let best = null;
+        for (const ln of out.split('\n')) {
+          const m = ln.match(/_id=(\d+),\s*_data=(\S+)/);
+          if (m) { const id = parseInt(m[1], 10); if (!best || id > best.id) best = { id, path: m[2].trim() }; }
+        }
+        return best;
+      } catch (_) { return null; }
+    };
+    const before = newest();
+    const beforeId = before ? before.id : -1;
+    this.open('camera'); sleep(1500);
+    // clear any first-run / permission dialogs by granting the obvious choice
+    for (let i = 0; i < 3; i++) {
+      this._silentSee();
+      const allow = this._els.find((e) => e.clickable &&
+        /^(while using the app|allow|next|ok|got it)$/i.test((e.label || '').trim()));
+      const shutter = this._els.find((e) => /shutter|capture|take photo/i.test(e.label || ''));
+      if (shutter) break;
+      if (allow) { adbShell(`input tap ${allow.bounds.cx} ${allow.bounds.cy}`); sleep(1200); }
+      else break;
+    }
+    // press the shutter
+    this._silentSee();
+    const sh = this._els.find((e) => /shutter|capture|take photo/i.test(e.label || ''));
+    if (!sh) { console.log(JSON.stringify({ error: 'no shutter button found', screen: this._view() })); return this; }
+    adbShell(`input tap ${sh.bounds.cx} ${sh.bounds.cy}`);
+    sleep(2000); // let the capture write to storage
+
+    // poll until a NEW image (higher _id than before) shows up — up to ~10s.
+    let after = newest(), tries = 0;
+    while (tries++ < 12 && (!after || after.id <= beforeId)) {
+      sleep(800); after = newest();
+    }
+    if (!after || after.id <= beforeId) {
+      console.log(JSON.stringify({ error: 'photo not found in MediaStore after capture', lastSeen: after }));
+      return this;
+    }
+
+    const result = { photo: after.path };
+    if (pull) {
+      const base = after.path.split('/').pop();
+      const local = `${dir}/${base}`;
+      try { adb(`pull "${after.path}" "${local}"`); result.pulled = local; }
+      catch (e) { result.pullError = String(e.message || e); }
+    }
+    console.log(JSON.stringify(result));
+    return this;
+  }
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -567,6 +632,12 @@ const ROUTER = {
   },
   notif: {
     list: () => phone.notifications(),
+  },
+  // camera: take a real photo in one call. `camera shot` (or `camera photo`).
+  // pass {"pull":true} to also copy it to the computer for a multimodal brain.
+  camera: {
+    shot:  (a) => phone.photo(typeof a === 'object' ? a : {}),
+    photo: (a) => phone.photo(typeof a === 'object' ? a : {}),
   },
   app: {
     list: () => phone.appList(),
