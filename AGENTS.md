@@ -21,17 +21,31 @@ movicom <noun> <verb> [arg]
 - **Output is ALWAYS one JSON value** — parse it. Reads return data; writes return
   `{opened:...}`/`{saved:...}`/`{added:...}`; failures return `{error:"..."}`.
 
-## Reading the screen — `ui see`
+## Reading the screen — `ui see` (your interface, as a menu)
+
+`ui see` (and every action) returns a **menu designed for you** — not a raw screen
+dump. Read it like an IVR/phone menu and pick:
 
 ```json
-{"app":"settings","tap":["Wi-Fi","Apps","Notifications"],"type":["Search settings"],"read":["Network & internet"],"scroll":true}
+{"where":"chrome","actions":["Search","Images","Maps"],"fields":["Search or type URL"],
+ "text":["Buenos Aires","mar, Nublado, máx 14° mín 11°"],"can_scroll":true,
+ "page":"1/8","hint":"fill a field: ui fill '{\"Search\":\"...\"}'  |  more actions: ui more"}
 ```
 
-- `app` — foreground app (short name).
-- `tap` — labels you can tap. Act by name: `movicom ui tap "Wi-Fi"`.
-- `type` — editable fields. Their current values also appear in `read`.
-- `read` — visible non-interactive text (and field values).
-- `scroll` — true if scrollable; `ui scroll down` then `ui see` again.
+- `where` — what screen/app you're on.
+- `actions` — labels you can **tap**: `movicom ui tap "Maps"`. Shown one **page** at
+  a time (~12) to stay cheap. `page:"1/8"` = there are 8 pages.
+- `fields` — inputs you can **fill** (by name): `movicom ui fill '{"<name>":"..."}'`.
+  Unnamed inputs are `field 1`, `field 2`…
+- `text` — the visible content (what a news page or weather card SAYS).
+- `can_scroll` — true → `ui scroll down` reveals more content.
+- `page` + `ui more` — flip to the next page of actions WITHOUT re-reading the
+  whole screen. You can still `ui tap "<label>"` an action that's on a later page —
+  movicom finds it regardless of which page is shown. Only page when what you want
+  isn't on the current one.
+- `hint` — the exact next command(s) to try. When in doubt, do what the hint says.
+
+You browse this menu the way a human browses a UI. **Don't reason about pixels.**
 
 You think in **names**; movicom holds the coordinates. Never reason about pixels.
 If a label isn't there, it may be off-screen — `ui scroll down` and look again.
@@ -62,7 +76,7 @@ Opening is by package — it always lands. Never rely on swipe gestures to navig
 - `app intent '{"action":"...","extra":"-n pkg/activity"}'` — fire any intent
 
 ### UI lane (third-party apps with no back door)
-- `ui see [--coords|--raw]` · `ui tap "<label>"` · `ui type "<text>"`
+- `ui see [<page#>]` · `ui more` (next page of actions) · `ui tap "<label>"` · `ui type "<text>"`
 - `ui key <BACK|HOME|ENTER|TAB|ESCAPE|...>` · `ui scroll <down|up|left|right>`
 - `ui fill '{"First name":"Ada"}'` — multi-field form fill (handles keyboard shift)
 - `ui shot [file]` — low-res screenshot. **Fallback only**, for text-less screens.

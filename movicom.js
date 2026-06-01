@@ -141,6 +141,8 @@ class Phone {
   constructor() {
     this._els = [];        // last-seen elements (with coords — internal only)
     this._app = null;
+    this._page = 1;        // current action page (for the paged AIX menu)
+    this._pageSig = '';    // screen signature — resets paging when the screen changes
   }
 
   // ensure a window actually has focus, else uiautomator returns null-root
@@ -179,44 +181,79 @@ class Phone {
   // scroll, surface visible TEXT, and give a one-line HINT of how to act. The
   // model PICKS from a menu instead of analyzing pixels/arrays — the real win for
   // small LLMs. Neutral: we present faithfully, we don't guess intent.
-  _view({ coords = false, readCap = 12 } = {}) {
+  // The AII/AItext IS the interface (Andy's framing 2026-06-01: AII = AI Interface,
+  // AIX = AI Experience). We don't dump the raw screen — we design the experience
+  // for a model: name WHERE it is, present the ACTIONS it can tap as a PAGED menu
+  // (cheap by default, more on demand), the FIELDS it can fill, the visible TEXT,
+  // and a one-line HINT of how to act. The model browses a menu like a human
+  // browses a UI — it doesn't analyze pixels. Neutral: we present, we don't guess.
+  //
+  // Pagination (scar 2026-06-01: a Google results page had 115 actions = ~1200
+  // tok of mostly junk). We filter NOISE, then show one PAGE of ~12 actions and
+  // report page N/M + how to get the next page (`ui more`). The FULL action list
+  // is cached so `ui tap "<label>"` still resolves an item on ANY page, not just
+  // the visible one. `page` arg jumps to a specific page; null = current.
+  _view({ coords = false, readCap = 12, pageSize = 12, page = null } = {}) {
     const xml = this._dump();
     this._els = parseScreen(xml);
     this._app = foregroundApp();
 
-    const actions = [], fields = [], text = [];
+    const rawActions = [], fields = [], text = [];
     let scroll = false;
     for (const e of this._els) {
       if (e.scrollable) scroll = true;
       if (e.editable) {
-        if (e.label) fields.push(coordize(e, coords)); // the field's hint/label = its name
+        if (e.label) fields.push(coordize(e, coords));
         continue;
       }
-      if (e.clickable && e.label) { actions.push(coordize(e, coords)); continue; }
+      if (e.clickable && e.label) { rawActions.push(coordize(e, coords)); continue; }
       if (e.label) text.push(e.label);
     }
-    const A = dedupe(actions), F = dedupe(fields), T = dedupe(text).slice(0, readCap);
 
-    // one-line hint: how to act on THIS screen (mechanical, not a guess of intent)
+    const allActions = dedupe(rawActions).filter(a => !isNoise(labelOf(a)));
+    const F = dedupe(fields);
+    const T = dedupe(text).filter(t => !isNoise(t)).slice(0, readCap);
+
+    // page math. `page` resets when the screen identity changes (so `ui more` on a
+    // new screen starts at page 1, not wherever we left off elsewhere).
+    const sig = this._app.pkg + ':' + allActions.length + ':' + (allActions[0] ? labelOf(allActions[0]) : '');
+    if (sig !== this._pageSig) { this._page = 1; this._pageSig = sig; }
+    const totalPages = Math.max(1, Math.ceil(allActions.length / pageSize));
+    if (page != null) this._page = Math.min(Math.max(1, page), totalPages);
+    const p = Math.min(this._page, totalPages);
+    const A = allActions.slice((p - 1) * pageSize, p * pageSize);
+
     const parts = [];
-    if (F.length) parts.push(`fill a field: ui fill '{"${typeof F[0] === 'string' ? F[0] : F[0].l}":"..."}'`);
-    if (A.length) parts.push(`tap an action: ui tap "${typeof A[0] === 'string' ? A[0] : A[0].l}"`);
-    if (scroll) parts.push('more below: ui scroll down');
+    if (F.length) parts.push(`fill a field: ui fill '{"${labelOf(F[0])}":"..."}'`);
+    if (A.length) parts.push(`tap an action: ui tap "${labelOf(A[0])}"`);
+    if (totalPages > 1 && p < totalPages) parts.push('more actions: ui more');
+    if (scroll) parts.push('more content below: ui scroll down');
     const hint = parts.join('  |  ') || 'nothing actionable — try ui scroll down, or ui back';
 
-    return {
-      where: shortApp(this._app.pkg),   // the location, named
-      actions: A,                        // what you can TAP (buttons/links)
-      fields: F,                         // what you can FILL (inputs, by name)
-      text: T,                           // visible non-interactive text
+    const view = {
+      where: shortApp(this._app.pkg),
+      actions: A,
+      fields: F,
+      text: T,
       can_scroll: scroll,
-      hint,                              // the "telephone menu" line: what to do next
+      hint,
     };
+    if (totalPages > 1) view.page = `${p}/${totalPages}`; // only when there's >1 page
+    return view;
   }
 
-  see({ coords = false, raw = false, readCap = 12 } = {}) {
+  see({ coords = false, raw = false, readCap = 12, page = null } = {}) {
     if (raw) { const xml = this._dump(); console.log(xml); return this; }
-    console.log(JSON.stringify(this._view({ coords, readCap })));
+    console.log(JSON.stringify(this._view({ coords, readCap, page })));
+    return this;
+  }
+
+  // advance to the next page of actions on the CURRENT screen (the AIX "show more"
+  // — lazy-load the rest of the menu only when the model needs it). No re-tap, no
+  // scroll; same screen, next slice. Wraps to page 1 after the last page.
+  more() {
+    this._page = (this._page || 1) + 1;
+    console.log(JSON.stringify(this._view({ page: this._page })));
     return this;
   }
 
@@ -577,6 +614,27 @@ function coordize(e, withCoords) {
   return withCoords ? { l: e.label || `(${e.cls})`, xy: [e.bounds.cx, e.bounds.cy] }
                     : (e.label || `(${e.cls})`);
 }
+// the label string out of either shape (plain string, or {l, xy} when coords on)
+function labelOf(a) { return typeof a === 'string' ? a : (a && a.l) || ''; }
+
+// Is this label noise an agent never needs? Raw URLs / tracking params / encoded
+// query strings, and universal nav/footer boilerplate. Conservative on purpose —
+// we only drop things that are clearly not a meaningful choice. (scar 2026-06-01)
+const NOISE_RE = /^(https?:\/\/|www\.)|[?&](sa|ved|ei|oq|gs_|sei|ec|client|sourceid)=|%[0-9A-Fa-f]{2}.*%[0-9A-Fa-f]{2}/;
+const NOISE_EXACT = new Set([
+  'privacidad', 'condiciones', 'privacy', 'terms', 'ayuda', 'help', 'comentario',
+  'comentarios', 'feedback', 'acerca de este resultado', 'about this result',
+  'menú principal', 'main menu', 'configuración de búsqueda', 'search settings',
+  'cómo se utiliza la ubicación', 'connection is secure',
+]);
+function isNoise(label) {
+  const s = String(label || '').trim();
+  if (!s) return true;
+  if (s.length > 120) return true;                 // a paragraph isn't a tap target
+  if (NOISE_RE.test(s)) return true;
+  if (NOISE_EXACT.has(s.toLowerCase())) return true;
+  return false;
+}
 function dedupe(arr) {
   const seen = new Set(); const out = [];
   for (const x of arr) { const k = JSON.stringify(x); if (!seen.has(k)) { seen.add(k); out.push(x); } }
@@ -646,7 +704,8 @@ const ROUTER = {
   },
   // ---- UI lane: drive the glass (third-party apps with no back door) ----
   ui: {
-    see:    (a) => phone.see(typeof a === 'object' ? a : {}),
+    see:    (a) => phone.see(typeof a === 'object' ? a : (typeof a === 'string' && /^\d+$/.test(a) ? { page: parseInt(a, 10) } : {})),
+    more:   () => phone.more(),
     tap:    (a) => phone.tap(typeof a === 'string' ? a : (a && a.label)),
     type:   (a) => phone.type(typeof a === 'string' ? a : (a && a.text)),
     key:    (a) => phone.key(typeof a === 'string' ? a : (a && a.key)),
