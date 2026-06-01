@@ -1,29 +1,38 @@
 {
   "name": "movicom",
-  "version": "0.2.0",
-  "description": "Give an AI agent a body on a phone — drive a real Android over adb, reading the screen as cheap structured text instead of screenshots.",
+  "version": "0.3.0",
+  "description": "Give an AI agent a body on a phone — drive a real Android over adb. Reads the screen as a menu designed for the model (cheap), not screenshots. Light enough for a 9B local model.",
   "main": "movicom.js",
   "bin": {
     "movicom": "movicom.js"
   },
   "scripts": {
-    "see": "node movicom.js see"
+    "doctor": "node movicom.js doctor"
   },
   "keywords": [
     "android",
     "adb",
     "agent",
+    "agents",
     "llm",
+    "local-llm",
     "automation",
     "ai",
     "uiautomator",
-    "mobile"
+    "mobile",
+    "phone",
+    "computer-use",
+    "tool-use"
   ],
   "author": "Andy Cufari",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/andycufari/movicom.git"
+  },
+  "homepage": "https://github.com/andycufari/movicom#readme",
+  "bugs": {
+    "url": "https://github.com/andycufari/movicom/issues"
   },
   "engines": {
     "node": ">=14"
@@ -33,6 +42,7 @@
     "movicom.js",
     "README.md",
     "AGENTS.md",
+    "HOWTO.md",
     "LICENSE"
   ]
 }
