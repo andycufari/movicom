@@ -65,11 +65,14 @@ Requires [`adb`](https://developer.android.com/tools/adb) (Android Platform Tool
 and Node.js 14+. No npm dependencies.
 
 ```bash
-git clone git@github.com:andycufari/movicom.git
-cd movicom
-# connect a device (see "Configuring the phone" below), then:
-node movicom.js see
+npm install -g movicom
+adb version && movicom doctor
 ```
+
+**New here? Read [HOWTO.md](HOWTO.md)** — a step-by-step setup guide: install adb +
+movicom (Mac & Windows), prepare the Android phone (developer mode, USB or wireless
+debugging), recommended phone settings, and connect/verify. Covers real devices and
+the emulator.
 
 ## Usage
 

@@ -173,29 +173,44 @@ class Phone {
   // (Andy's idea, 2026-05-31): the model never needs a separate `see` to learn
   // what its tap did. `readCap` lets content-heavy screens (a news article) widen
   // the text beyond the default 12-item noise cap.
+  // The text IS the UI. We don't dump the raw screen — we present a MENU for the
+  // model (Andy's framing, 2026-05-31): like an IVR phone menu, name WHERE it is,
+  // list the ACTIONS it can tap and the FIELDS it can fill, say whether it can
+  // scroll, surface visible TEXT, and give a one-line HINT of how to act. The
+  // model PICKS from a menu instead of analyzing pixels/arrays — the real win for
+  // small LLMs. Neutral: we present faithfully, we don't guess intent.
   _view({ coords = false, readCap = 12 } = {}) {
     const xml = this._dump();
     this._els = parseScreen(xml);
     this._app = foregroundApp();
 
-    const tap = [], type = [], read = [];
+    const actions = [], fields = [], text = [];
     let scroll = false;
     for (const e of this._els) {
       if (e.scrollable) scroll = true;
       if (e.editable) {
-        if (e.label) read.push(e.label);
-        type.push(coordize(e, coords));
+        if (e.label) fields.push(coordize(e, coords)); // the field's hint/label = its name
         continue;
       }
-      if (e.clickable && e.label) { tap.push(coordize(e, coords)); continue; }
-      if (e.label) read.push(e.label);
+      if (e.clickable && e.label) { actions.push(coordize(e, coords)); continue; }
+      if (e.label) text.push(e.label);
     }
+    const A = dedupe(actions), F = dedupe(fields), T = dedupe(text).slice(0, readCap);
+
+    // one-line hint: how to act on THIS screen (mechanical, not a guess of intent)
+    const parts = [];
+    if (F.length) parts.push(`fill a field: ui fill '{"${typeof F[0] === 'string' ? F[0] : F[0].l}":"..."}'`);
+    if (A.length) parts.push(`tap an action: ui tap "${typeof A[0] === 'string' ? A[0] : A[0].l}"`);
+    if (scroll) parts.push('more below: ui scroll down');
+    const hint = parts.join('  |  ') || 'nothing actionable — try ui scroll down, or ui back';
+
     return {
-      app: shortApp(this._app.pkg),
-      tap: dedupe(tap),
-      type: dedupe(type),
-      read: dedupe(read).slice(0, readCap),
-      scroll,
+      where: shortApp(this._app.pkg),   // the location, named
+      actions: A,                        // what you can TAP (buttons/links)
+      fields: F,                         // what you can FILL (inputs, by name)
+      text: T,                           // visible non-interactive text
+      can_scroll: scroll,
+      hint,                              // the "telephone menu" line: what to do next
     };
   }
 
