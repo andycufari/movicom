@@ -448,6 +448,30 @@ class Phone {
     return this;
   }
 
+  // Open a URL (or run a web search) in the browser via a VIEW intent — the
+  // DETERMINISTIC way to reach the web. Don't fumble the address bar: if you know
+  // the URL, go straight there; if you have a query, we build the search URL.
+  // (scar 2026-06-01: tapping Chrome's omnibox + typing missed twice; the intent
+  // worked first try.) Returns the screen after the page loads. `wait` ms to let
+  // the page render before reading (default 3500).
+  web(target, { search = false, wait = 5000 } = {}) {
+    let url = String(target || '').trim();
+    if (search || !/^https?:\/\//i.test(url)) {
+      // treat it as a search query (or bare domain → search is safer than guessing https)
+      if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(url) && !search) {
+        url = 'https://' + url;                       // looks like a domain → go there
+      } else {
+        url = 'https://www.google.com/search?q=' + encodeURIComponent(url);
+      }
+    }
+    // single-quote the URL so &, ?, = survive the shell
+    adbShell(`am start -a android.intent.action.VIEW -d '${url.replace(/'/g, "%27")}'`);
+    sleep(wait);
+    this._els = [];
+    console.log(JSON.stringify({ opened: url, screen: this._view() }));
+    return this;
+  }
+
   // robust multi-field form fill (scars 2026-05-31, Gmail compose). Pass
   // {labelOrHint: value}. Per field: resolve from a FRESH dump (keyboard shifts
   // the layout ~436px), tap to FOCUS it (type() types into whatever is focused —
@@ -690,6 +714,17 @@ const ROUTER = {
   },
   notif: {
     list: () => phone.notifications(),
+  },
+  // web: reach the internet DETERMINISTICALLY — don't fumble the address bar.
+  //   web open <url>        → load a URL
+  //   web go <url-or-domain>→ same (domain gets https://)
+  //   web search <query>    → load the Google results for the query
+  // Returns the loaded page as the usual screen menu. If you know the URL, GO
+  // straight there; only `ui` your way through a page when you must.
+  web: {
+    open:   (a) => phone.web(typeof a === 'string' ? a : (a && a.url)),
+    go:     (a) => phone.web(typeof a === 'string' ? a : (a && a.url)),
+    search: (a) => phone.web(typeof a === 'string' ? a : (a && a.q), { search: true }),
   },
   // camera: take a real photo in one call. `camera shot` (or `camera photo`).
   // pass {"pull":true} to also copy it to the computer for a multimodal brain.
