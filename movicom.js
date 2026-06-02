@@ -672,9 +672,13 @@ class Phone {
   // app + goes home first, so it ALWAYS launches at its main screen — a determin-
   // istic anchor every macro can rely on as step 1.
   open(app, { fresh = false } = {}) {
-    // "home" has no launchable activity — it's the HOME key.
+    // "home" has no launchable activity — it's the HOME key. Use a SILENT home
+    // keyevent (not this.home(), which prints its own frame) so open() emits
+    // exactly ONE JSON value — a 9B parses one line, two lines breaks it (scar
+    // 2026-06-02: `app fresh` printed the launcher frame THEN {opened}, so Michi
+    // read the launcher and thought WhatsApp never opened).
     if (/^home$/i.test(String(app).trim())) {
-      this.home(); sleep(800);
+      adbShell('input keyevent KEYCODE_HOME'); sleep(800);
       console.log(JSON.stringify({ opened: 'home' }));
       return this;
     }
@@ -686,7 +690,7 @@ class Phone {
     try {
       if (fresh) {
         try { adbShell(`am force-stop ${pkg}`); } catch (_) {}
-        this.home(); sleep(500);
+        adbShell('input keyevent KEYCODE_HOME'); sleep(500);   // silent — see above
       }
       const r = adbShell(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
       sleep(fresh ? 2200 : 1600); this._els = [];
