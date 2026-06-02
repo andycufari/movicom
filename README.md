@@ -7,18 +7,21 @@ acting by **name** instead of pixel coordinates. Light enough that a small **9B
 local model** can drive it.
 
 ```bash
-movicom web search "world cup 2026 first match"
-movicom ui see
-# → {"where":"chrome",
-#    "text":["The 2026 World Cup opens Thu June 11, 2026 — Mexico vs South Africa,
-#             Estadio Azteca, Mexico City"],
-#    "actions":["Images","Maps","News"], "fields":["Search"],
-#    "can_scroll":true, "page":"1/8",
-#    "hint":"tap an action: ui tap \"Images\"  |  more actions: ui more"}
+movicom app fresh whatsapp
+movicom ui frame
+# → {"app":"whatsapp",
+#    "read":["Andres: Buen día ☀️","you: Quinto test (Delivered)","Andres: HOP"],
+#    "do":["1 type <text>","2 send","3 up","4 down","5 back","6 home",
+#          "7 open: Andres","8 open: Video call","9 more (12 more, page 1/2)"],
+#    "pick":"act with: ui do <n>   (e.g. ui do 1 \"your text\")"}
+movicom ui do 7            # open the chat (by number)
+movicom ui do 1 "hola"    # type
+movicom ui do send        # send
 ```
 
-No screenshot. No API. No browser extension. movicom read the answer off the phone
-as text — the way a person would.
+No screenshot. No API. No browser extension. movicom reads the screen as a **frame**
+— what to READ, what to DO (numbered) — and acts by number or verb, the way a person
+uses a phone. Same gestures drive WhatsApp, Instagram, Gmail, Settings — *any* app.
 
 **Building an agent on movicom? Read [AGENTS.md](AGENTS.md)** (the operating manual
 for LLMs) and **[HOWTO.md](HOWTO.md)** (set up adb + a phone in minutes).
@@ -94,12 +97,13 @@ Grammar: `movicom <noun> <verb> [arg|json]`. Every command prints **one JSON val
 
 ```bash
 movicom doctor                       # where am I? device + foreground app
+movicom app fresh whatsapp           # open an app at a clean start point
+movicom ui frame                     # read the screen as {app, read[], do[]} (numbered)
+movicom ui do 7                      # run action #7 (e.g. open a chat)
+movicom ui do 1 "the message"        # type into the input
+movicom ui do send                   # send (verb mode — self-healing)
+movicom app store instagram          # open an app's Play Store page (then ui do Install)
 movicom web search "best ramen near me"   # reach the web (don't fumble the omnibox)
-movicom app open gmail               # launch an app by name
-movicom ui see                       # read the screen as a menu
-movicom ui tap "Compose"             # act by NAME (movicom holds the coords)
-movicom ui fill '{"Subject":"Hi","Compose email":"the body"}'
-movicom ui more                      # next page of actions on a busy screen
 movicom camera shot '{"pull":true}'  # take a real photo, copy it to the computer
 ```
 
@@ -108,21 +112,22 @@ movicom camera shot '{"pull":true}'  # take a real photo, copy it to the compute
 | Verb | What it does |
 |---|---|
 | `doctor` / `devices` | Device + foreground app / list adb devices. Start here. |
-| `web open <url>` · `web go <domain>` · `web search <query>` | Reach the internet deterministically via an intent — no address-bar fumbling. |
+| **`ui frame`** (alias `ui f`) | **Read the screen as `{app, read[], do[]}` — content + NUMBERED actions. The front door.** |
+| **`ui do <n> [text]`** | **Run action #n (optionally with text); returns the next frame. `ui do more` pages.** |
+| **`ui do <verb> [text]`** | **Verb mode (self-healing, for macros): `type` `type2` `send` `up` `down` `back` `home` `more`.** |
+| `app fresh <name>` | Secure start: force-stop + home + launch (deterministic reset). |
+| `app store <name>` | Open an app's Play Store page directly by package (skip search + ad trap). |
 | `app list` · `app open <name>` · `app intent '{...}'` | List / launch apps; fire a raw intent. |
-| `ui see [page#]` | Read the screen as a menu: `{where, actions[], fields[], text[], can_scroll, page, hint}`. |
-| `ui more` | Next page of actions (busy screens are paginated to stay cheap). |
-| `ui tap "<label>"` | Tap the element matching `label` (resolves across all pages). |
-| `ui type "<text>"` · `ui fill '{field: value}'` | Type into the focused field / fill a multi-field form (focuses each field first). |
-| `ui key <BACK\|HOME\|ENTER\|…>` · `ui scroll <dir>` · `ui back` · `ui home` | Keys, swipes, navigation. |
-| `kbd off` / `kbd on` | Disable/enable the soft keyboard — stops layout shift so forms fill reliably. |
-| `contacts list\|find\|add` · `notif list` | System lane: talk to the OS, not the glass. |
+| `web open <url>` · `web go <domain>` · `web search <query>` | Reach the internet deterministically via an intent. |
+| `contacts list\|find\|add` | System lane: talk to the OS, not the glass. |
+| `notif list [--since ms\|--apps a,b\|--all]` | Notifications as `{pkg,app,title,text,when,key,category}`; system noise dropped by default. The heartbeat primitive. |
 | `camera shot '{"pull":true}'` | Take a real photo; `pull` copies it back so a multimodal model can SEE it. |
-| `ui shot [file]` | Low-res screenshot — explicit fallback for text-less screens. |
-| `workflow add\|run\|list\|del` | Save & replay named command sequences (shareable macros). |
+| `workflow add\|run\|list\|del` | App-specific macros over the agnostic frame (parameterized `$1 $2`, self-healing). |
+| `ui see` · `ui tap "<label>"` · `ui fill '{...}'` · `ui shot` | Low-level lane: act on a specific element by name; screenshot fallback. |
+| `kbd off` / `kbd on` | (Mostly automatic now — every action dismisses the keyboard.) |
 
-Every **action** (`ui tap/type/key/scroll/fill`) returns `{<result>, screen:{...}}` —
-the fresh menu after the action — so the model doesn't need a separate `ui see`.
+Every `ui do` returns the next **frame**, so the model never needs a separate read
+between actions — read, pick a number, see what changed.
 
 ## Configuring the phone
 
@@ -137,12 +142,16 @@ movicom doctor   # device + current foreground app
 
 ## Status
 
-Early but real, and dogfooded hard. Proven on an Android emulator + real Android:
-reading screens as a menu, filling multi-field forms, sending an email through the
-Gmail app, taking a photo, reading live web answers, writing a contact — all
-verified against ground truth (the MediaStore / content provider / a received
-email), not just the screen. It's UI-driven, so it can break when an app redesigns —
-that's the trade for reaching apps that have no API. Built in the open.
+Early but real, and dogfooded hard. Proven on a real Android phone: reading any
+screen as a frame, sending WhatsApp messages, **installing Instagram from the Play
+Store, logging in, and reading the profile + DM inbox** — plus filling multi-field
+forms, sending email through Gmail, taking a photo, reading live web answers. All
+verified against ground truth (the package list / MediaStore / a received message),
+not just the screen. It's UI-driven, so it can break when an app redesigns — that's
+the trade for reaching apps that have no API. Built in the open.
+
+**Your phone. Your accounts. Your work.** movicom drives apps you're already logged
+into; it never creates accounts or impersonates anyone.
 
 Contributions welcome. Found a screen movicom mis-reads? Run `movicom ui see --raw`
 on it and open an issue with the XML — the parser learns from real screens.
