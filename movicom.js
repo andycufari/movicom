@@ -435,21 +435,22 @@ class Phone {
       })
       .map((x) => x.e);
 
-    // PAGING for `more`: show one page of opens; `more` advances INLINE (it does NOT
-    // tap an overflow control that could navigate — scar 2026-06-02: `do more`
-    // jumped to the profile). An overflow ⋮ is offered as its OWN `open`, not as
-    // `more`, so opening a menu is an explicit choice, never a side effect of paging.
+    // PAGING for `more` is CUMULATIVE — `more` REVEALS the next batch on top of the
+    // ones already shown, in ONE continuous numbering. This is the fix for the worst
+    // AIX bug (Haiku, 2026-06-02): page-replace paging desynced the displayed labels
+    // from `ui do <n>` (page-2 label, page-1 target → wrong contact). With cumulative
+    // paging a number ALWAYS means the same action, on any page; nothing shifts.
     const page = expand ? (this._openPage || 1) : 1;
     if (!expand) this._openPage = 1;
     const total = opens.length;
-    const totalPages = Math.max(1, Math.ceil(total / openCap));
-    const p = Math.min(page, totalPages);
-    const shownOpens = opens.slice((p - 1) * openCap, p * openCap);
+    const shownCount = Math.min(total, page * openCap);
+    const shownOpens = opens.slice(0, shownCount);          // 0..N cumulative, not a window
     for (const e of shownOpens) add('open', `open: ${e.label.slice(0, 48)}`, 'open', e);
     // surface an overflow ⋮ as a normal open (explicit), if present
     for (const ov of c.overflow.slice(0, 1)) add('open', `open: ${(ov.label || 'menu').slice(0, 40)}`, 'open', ov);
 
-    if (p < totalPages) add('more', `more  (${total - p * openCap} more, page ${p}/${totalPages})`, 'more', null);
+    const hidden = total - shownCount;
+    if (hidden > 0) add('more', `more  (${hidden} more)`, 'more', null);
 
     this._do = doList; // resolver for do N
 
@@ -477,7 +478,12 @@ class Phone {
   // ALWAYS rebuild the frame first so we act on what's on screen NOW, never a stale
   // cached numbering (the macro bug: `do 1` hit "back" because the frame had changed).
   do(n, arg) {
-    this._frame();                                              // fresh frame every time
+    // Rebuild the frame PRESERVING the current page (expand:true honors _openPage),
+    // so the numbers we resolve match the page the model just saw. Rebuilding at
+    // page 1 was a correctness bug: after `ui do more` showed page 2, the next
+    // `ui do 12` silently fired page-1's #12 — a DIFFERENT target (Haiku nearly
+    // messaged the wrong contact, 2026-06-02). Numbers must mean what was displayed.
+    this._frame({ expand: true });
     let a;
     const asVerb = String(n).trim().toLowerCase();
     if (/^\d+$/.test(String(n).trim())) {
