@@ -40,6 +40,41 @@ function adbShell(args) {
 }
 const sleep = (ms) => { const e = Date.now() + ms; while (Date.now() < e) {} };
 
+// Type text via `adb shell input text` SAFELY. The text crosses two shells (local
+// execSync → device sh), so unescaped metacharacters (> < & | ; $ ( ) ` ") break
+// it — scar 2026-06-01: a "->" in a WhatsApp message made the device sh try to
+// REDIRECT to a file ("Read-only file system"). Also: `input text` uses %s for a
+// space, and chokes on non-ASCII (emoji throw a NullPointerException), so we strip
+// what it can't send rather than crash the whole message. Returns false if the
+// text became empty after stripping (caller can skip the send).
+// Type text via `adb shell input text`. HARD TRUTH (verified on Moto G06 /
+// Android 15, 2026-06-01): the device's `input text` is effectively ASCII-only —
+// ANY non-ASCII char (emoji AND Latin-1 accents like é ñ ü) throws a
+// NullPointerException and drops the WHOLE message. So we: (1) transliterate
+// common accents to their base letter (qué→que, ñ→n) to stay readable on a LATAM
+// phone instead of losing chars; (2) drop anything still non-ASCII (emoji); then
+// (3) escape device-shell specials (> < & | ( ) … — scar: a "->" tried to
+// REDIRECT to a Read-only file) and map spaces to %s. A true Unicode path
+// (base64→clipboard paste, or an ADBKeyboard IME) is a future upgrade.
+// Returns false if nothing typeable remained (caller can skip the send).
+const ACCENTS = { 'á':'a','à':'a','ä':'a','â':'a','ã':'a','é':'e','è':'e','ë':'e','ê':'e','í':'i','ì':'i','ï':'i','î':'i','ó':'o','ò':'o','ö':'o','ô':'o','õ':'o','ú':'u','ù':'u','ü':'u','û':'u','ñ':'n','ç':'c','¿':'','¡':'','«':'"','»':'"','‘':"'",'’':"'",'“':'"','”':'"','–':'-','—':'-','…':'...' };
+function typeText(text) {
+  let s = String(text);
+  s = s.replace(/[À-ÿ¿¡«»''""–—…]/g, (ch) => {
+    const lower = ch.toLowerCase();
+    const t = ACCENTS[lower];
+    if (t === undefined) return ch;
+    return ch === lower ? t : t.toUpperCase();   // preserve case (Ñ→N, ñ→n)
+  });
+  s = s.replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ''); // drop anything still non-ASCII (emoji)
+  if (!s.trim()) return false;
+  const esc = s
+    .replace(/(["'\\`$&|;<>()!*?\[\]{}~#])/g, '\\$1')
+    .replace(/ /g, '%s');
+  adbShell(`input text "${esc}"`);
+  return true;
+}
+
 let _versionChecked = false;
 function checkAdbVersion() {
   if (_versionChecked || process.env.MOVICOM_SKIP_VERSION_CHECK) return;
@@ -96,10 +131,20 @@ function parseScreen(xml) {
       bounds,
     };
 
-    const label = decodeEntities((a['text'] || '').trim() || (a['content-desc'] || '').trim());
+    const txt = (a['text'] || '').trim();
+    const desc = (a['content-desc'] || '').trim();
+    const label = decodeEntities(txt || desc);
     const cls = (a['class'] || '').split('.').pop();
     const scrollable = a['scrollable'] === 'true';
-    const editable = cls === 'EditText' || a['password'] === 'true';
+    const isPassword = a['password'] === 'true';
+    const editable = cls === 'EditText' || isPassword;
+    // a field's "hint" — its content-desc when it has no typed text — tells inputs
+    // apart in a form (e.g. "Username", "Password"). Used to label `type` actions.
+    const hint = desc && !txt ? decodeEntities(desc) : '';
+    // a control = a button/icon whose meaning is its content-desc (Send, Attach,
+    // Back…), not a text blob. These are the things a user ACTS with; rank them
+    // above content that merely happens to be clickable (chat bubbles, list rows).
+    const isControl = (!txt && !!desc) || cls === 'ImageButton' || cls === 'Button' || cls === 'ImageView';
 
     // is this node OR any ancestor clickable? if ancestor, tap THERE.
     let tapTarget = node.clickable ? bounds : null;
@@ -117,7 +162,8 @@ function parseScreen(xml) {
         els.push({
           label, cls,
           clickable: isTappable,
-          scrollable, editable,
+          scrollable, editable, isControl,
+          password: isPassword, hint,
           bounds: tapTarget || bounds, // tap the clickable ancestor, not the dead label
         });
       }
@@ -198,7 +244,7 @@ class Phone {
     this._els = parseScreen(xml);
     this._app = foregroundApp();
 
-    const rawActions = [], fields = [], text = [];
+    const controls = [], rowActions = [], fields = [], text = [];
     let scroll = false;
     for (const e of this._els) {
       if (e.scrollable) scroll = true;
@@ -206,11 +252,21 @@ class Phone {
         if (e.label) fields.push(coordize(e, coords));
         continue;
       }
-      if (e.clickable && e.label) { rawActions.push(coordize(e, coords)); continue; }
+      if (e.clickable && e.label) {
+        // A long clickable text blob is CONTENT (a chat bubble, a list row preview),
+        // not a control — surface it as text AND keep it tappable, but rank it after
+        // the real controls so Send/Attach/etc. never get paginated off page 1.
+        const longBlob = !e.isControl && e.label.length > 40;
+        if (longBlob) text.push(e.label);
+        (e.isControl ? controls : rowActions).push(coordize(e, coords));
+        continue;
+      }
       if (e.label) text.push(e.label);
     }
 
-    const allActions = dedupe(rawActions).filter(a => !isNoise(labelOf(a)));
+    // controls first (Send, Attach, Back…), then row/content actions. So the bottom
+    // input-bar buttons land on page 1 where a model expects to find "how do I send?"
+    const allActions = dedupe([...controls, ...rowActions]).filter(a => !isNoise(labelOf(a)));
     const F = dedupe(fields);
     const T = dedupe(text).filter(t => !isNoise(t)).slice(0, readCap);
 
@@ -257,6 +313,248 @@ class Phone {
     return this;
   }
 
+  // ============================================================================
+  // THE FRAME — the app-agnostic AIX (my interface, designed 2026-06-01).
+  //
+  // Every action returns ONE frame. A frame separates what to READ from what to
+  // DO, and every DO is NUMBERED. The model reads `read`, picks `do N`, and gets
+  // the next frame back. It never needs to know an app's labels ("Send" vs
+  // "content-desc=Send") — movicom CLASSIFIES the raw tree into a small fixed
+  // vocabulary so the SAME gestures drive WhatsApp, Gmail, Settings, anything:
+  //
+  //   { app, screen, read: [...content...],
+  //     do: ["1 type <text>", "2 send", "3 down", "4 back", "5 more (N)", "6 open: …"] }
+  //
+  // Stable core verbs get low, predictable slots; variable items (list rows,
+  // links) get the higher numbers. `do more` expands overflow into a new frame —
+  // drilling in is the same gesture as everything else, no special pagination.
+  //
+  // KIND vocabulary a node is classified into:
+  //   input  — an EditText (→ `type`)
+  //   submit — a send/submit/post control (→ `send`)
+  //   nav    — up/down/back (scroll + system back)
+  //   more   — overflow (⋮ / "More options") (→ expands)
+  //   open   — anything else actionable (a chat row, a link, a button) (→ tap)
+  // Content (non-actionable text, long clickable blobs) goes to `read`.
+  // ============================================================================
+
+  // classify last-parsed els into {inputs, submits, opens, overflow, content, scroll}
+  _classify() {
+    const inputs = [], submits = [], opens = [], overflow = [], content = [];
+    let scroll = false;
+    const SUBMIT_RE = /^(send|submit|post|reply|publish|share|search|go|done|next|confirm|ok)\b/i;
+    const MORE_RE = /^(more options|more|overflow|⋮|options menu|see more)$/i;
+    // these are NAV/status/content masquerading as tappable rows — already covered
+    // by a core verb (back/home) or they're really read-only chrome (a timestamp,
+    // a delivery receipt). Keep them OUT of the numbered `open` list so it stays the
+    // things worth opening (chats, links, buttons), not every clickable pixel.
+    const NAV_DUP_RE = /^(back|navigate up|home|up)$/i;
+    const STATUS_RE = /^(\d{1,2}:\d{2}(\s?[ap]\.?m\.?)?|\d{1,2}:\d{2} ?[ap]m|delivered|read|sent|sending|seen|online|typing\.{0,3}|yesterday|today|\w+ \d{1,2}, \d{4})$/i;
+    for (const e of this._els) {
+      if (e.scrollable) scroll = true;
+      if (e.editable) { inputs.push(e); continue; }
+      if (!e.clickable || !e.label) { if (e.label) content.push(e.label); continue; }
+      const lab = e.label.trim();
+      if (NAV_DUP_RE.test(lab)) continue;                 // duplicate of the back/home verbs
+      if (STATUS_RE.test(lab)) { content.push(lab); continue; } // timestamp / receipt = read, not an action
+      if (SUBMIT_RE.test(lab)) { submits.push(e); continue; }
+      if (MORE_RE.test(lab)) { overflow.push(e); continue; }
+      // A clickable TEXTVIEW is almost always CONTENT that merely happens to be
+      // tappable — a chat-message bubble, a list-row title, a caption (scar
+      // 2026-06-02: IG DM messages like "our best video so far btw" landed in the
+      // `do` list, never in `read`). Surface as content; keep tappable too (it's
+      // still reachable as an open if the model wants to act on that message). A
+      // long blob is content regardless of class. Real controls (buttons/icons)
+      // and short non-text widgets stay actions.
+      const isTextual = e.cls === 'TextView' || e.cls === 'EditText';
+      if ((isTextual && !e.isControl) || (!e.isControl && lab.length > 40)) {
+        content.push(lab); opens.push(e); continue;
+      }
+      opens.push(e);
+    }
+    return { inputs, submits, opens, overflow, content, scroll };
+  }
+
+  // build the frame object (no printing). `expand` = page deeper into the opens.
+  _frame({ readCap = 10, openCap = 8, expand = false } = {}) {
+    const xml = this._dump();
+    this._els = parseScreen(xml);
+    this._app = foregroundApp();
+    const c = this._classify();
+
+    // reset the opens page when the SCREEN changes, so `more` on a new screen starts
+    // at page 1 (a fresh `frame`/non-expand read also resets it, below).
+    const fsig = this._app.pkg + ':' + this._els.length;
+    if (fsig !== this._frameSig) { this._openPage = 1; this._frameSig = fsig; }
+
+    // Assemble the DO list in STABLE order. Each entry: {n, verb, label, kind, el}.
+    // _do is the resolver `do N` uses; the strings in frame.do are what the model sees.
+    const doList = [];
+    let n = 0;
+    const add = (verb, label, kind, el) => { n++; doList.push({ n, verb, label, kind, el }); };
+
+    // ONE type action PER input field — so a multi-field form (login: username +
+    // password) is fully driveable by frame alone (scar 2026-06-02: `do type` only
+    // ever hit input #1, so the password needed a raw adb fallback). Each carries
+    // its hint/value so the model can tell the fields apart. First input keeps the
+    // bare verb `type`; the rest get `type2`, `type3`, … (and their own numbers).
+    const inputs = c.inputs;
+    inputs.forEach((inp, i) => {
+      const cur = (inp.label && inp.label !== inp.cls) ? inp.label : '';
+      const hint = inp.password ? 'password' : (cur ? `now: "${cur.slice(0, 24)}"` : (inp.hint || 'empty'));
+      const verb = i === 0 ? 'type' : `type${i + 1}`;
+      add(verb, `${verb} <text>  (${hint})`, 'input', inp);
+    });
+    // a submit verb only makes sense when there's an input to submit. A "Search
+    // settings" row with no text box is just a normal `open`, not a send (scar
+    // 2026-06-02: Settings showed a phantom "1 send"). If a submit control exists
+    // but there's no input, demote it to a regular open.
+    if (c.submits[0] && inputs.length) {
+      const hasDraft = inputs.some((inp) => (inp.label || '') && inp.label !== inp.cls);
+      add('send', hasDraft ? 'send' : 'send  (type something first)', 'submit', c.submits[0]);
+    } else if (c.submits[0]) {
+      c.opens.unshift(c.submits[0]); // no input → it's an ordinary tappable row
+    }
+    if (c.scroll) { add('up', 'up', 'nav'); add('down', 'down', 'nav'); }
+    add('back', 'back', 'nav');
+    add('home', 'home', 'nav');
+
+    // openable items (chat rows, links, buttons, top-bar icons). Dedupe by label.
+    const seen = new Set();
+    let opens = c.opens.filter((e) => { const k = e.label.toLowerCase(); if (seen.has(k) || isNoise(e.label)) return false; seen.add(k); return true; });
+    // RANK: top-bar nav ICONS first (Direct/DM, notifications, search, camera) so
+    // they never get paginated off page 1 (scar 2026-06-02: IG's Direct icon was
+    // buried behind stories → unreachable by frame). An icon = a control (no text,
+    // content-desc only) sitting in the top or bottom bar. Content rows come after.
+    const NAV_ICON_RE = /(direct|message|inbox|notif|activity|search|camera|new post|create|home|reels|profile|settings)/i;
+    opens = opens.map((e, i) => ({ e, i }))
+      .sort((a, b) => {
+        const ai = a.e.isControl && NAV_ICON_RE.test(a.e.label) ? 0 : 1;
+        const bi = b.e.isControl && NAV_ICON_RE.test(b.e.label) ? 0 : 1;
+        return ai - bi || a.i - b.i; // stable otherwise
+      })
+      .map((x) => x.e);
+
+    // PAGING for `more`: show one page of opens; `more` advances INLINE (it does NOT
+    // tap an overflow control that could navigate — scar 2026-06-02: `do more`
+    // jumped to the profile). An overflow ⋮ is offered as its OWN `open`, not as
+    // `more`, so opening a menu is an explicit choice, never a side effect of paging.
+    const page = expand ? (this._openPage || 1) : 1;
+    if (!expand) this._openPage = 1;
+    const total = opens.length;
+    const totalPages = Math.max(1, Math.ceil(total / openCap));
+    const p = Math.min(page, totalPages);
+    const shownOpens = opens.slice((p - 1) * openCap, p * openCap);
+    for (const e of shownOpens) add('open', `open: ${e.label.slice(0, 48)}`, 'open', e);
+    // surface an overflow ⋮ as a normal open (explicit), if present
+    for (const ov of c.overflow.slice(0, 1)) add('open', `open: ${(ov.label || 'menu').slice(0, 40)}`, 'open', ov);
+
+    if (p < totalPages) add('more', `more  (${total - p * openCap} more, page ${p}/${totalPages})`, 'more', null);
+
+    this._do = doList; // resolver for do N
+
+    const read = dedupe(c.content).filter((t) => !isNoise(t)).slice(0, readCap);
+    return {
+      app: shortApp(this._app.pkg),
+      do: doList.map((d) => `${d.n} ${d.label}`),
+      read,
+      pick: 'act with: ui do <n>   (e.g. ui do 1 "your text")',
+    };
+  }
+
+  // print a fresh frame (the new front door). `ui frame` or `ui f`.
+  frame(opts = {}) { console.log(JSON.stringify(this._frame(opts))); return this; }
+
+  // do <n|verb> [arg] — execute an action of the CURRENT frame, then return the
+  // NEXT frame so the model sees what changed. The whole loop is: read → do → read.
+  //
+  // TWO addressing modes (scar 2026-06-02):
+  //   NUMBER  (`do 1`)      — for INTERACTIVE use. Cheap, but position is screen-
+  //                           specific, so it's the wrong thing to bake into a macro.
+  //   VERB    (`do send`,   — for MACROS / replay. Re-resolves against the LIVE frame
+  //   `do type "hola"`)       every time, so a saved workflow SELF-HEALS when the UI
+  //                           shifts. `type`/`send`/`up`/`down`/`back`/`home`/`more`.
+  // ALWAYS rebuild the frame first so we act on what's on screen NOW, never a stale
+  // cached numbering (the macro bug: `do 1` hit "back" because the frame had changed).
+  do(n, arg) {
+    this._frame();                                              // fresh frame every time
+    let a;
+    const asVerb = String(n).trim().toLowerCase();
+    if (/^\d+$/.test(String(n).trim())) {
+      const idx = parseInt(n, 10);
+      a = this._do.find((d) => d.n === idx);
+      if (!a) { console.log(JSON.stringify({ error: `no action #${idx}`, frame: this._frame() })); return this; }
+    } else {
+      // verb mode: find the first action whose stable verb matches
+      a = this._do.find((d) => d.verb === asVerb);
+      // `send` fallback: some inputs have NO visible submit button (Play Store
+      // search, search bars) — they submit via the keyboard's action key. If a
+      // `send` was asked for but there's no submit control and an input exists,
+      // press ENTER instead of failing (scar 2026-06-02: Play Store search needed
+      // a raw KEYCODE_ENTER). Same for `search`/`go` aliases.
+      if (!a && /^(send|submit|search|go|enter)$/.test(asVerb) && this._do.some((d) => d.kind === 'input')) {
+        adbShell('input keyevent KEYCODE_ENTER'); sleep(900); this._dismissKb();
+        console.log(JSON.stringify({ did: 'submitted (enter)', frame: this._frame() })); return this;
+      }
+      if (!a) { console.log(JSON.stringify({ error: `no "${asVerb}" action on this screen`, available: this._do.map((d) => d.verb), frame: this._frame() })); return this; }
+    }
+
+    switch (a.kind) {
+      case 'input': {
+        if (arg == null || arg === '') { console.log(JSON.stringify({ error: 'do <n> needs text for an input, e.g. ui do 1 "hola"', frame: this._frame() })); return this; }
+        adbShell(`input tap ${a.el.bounds.cx} ${a.el.bounds.cy}`); sleep(350);
+        this._clearInput();                                       // wipe any existing draft first
+        if (!typeText(arg)) { console.log(JSON.stringify({ error: 'nothing typeable after stripping', frame: this._frame() })); return this; }
+        this._settle(); this._dismissKb();
+        console.log(JSON.stringify({ did: `typed "${arg}"`, frame: this._frame() })); return this;
+      }
+      case 'submit': {
+        adbShell(`input tap ${a.el.bounds.cx} ${a.el.bounds.cy}`); sleep(900); this._dismissKb();
+        console.log(JSON.stringify({ did: 'sent', frame: this._frame() })); return this;
+      }
+      case 'open': {
+        adbShell(`input tap ${a.el.bounds.cx} ${a.el.bounds.cy}`); sleep(900); this._dismissKb();
+        console.log(JSON.stringify({ did: `opened ${a.label.replace(/^open: /, '')}`, frame: this._frame() })); return this;
+      }
+      case 'more': {
+        // `more` ALWAYS pages the opens list INLINE — it never taps a control
+        // (scar 2026-06-02: tapping an overflow as "more" navigated to the profile
+        // instead of revealing hidden actions). An ⋮ menu is a normal `open` now.
+        this._openPage = (this._openPage || 1) + 1;
+        console.log(JSON.stringify({ did: `more (page ${this._openPage})`, frame: this._frame({ expand: true }) })); return this;
+      }
+      case 'nav': {
+        if (a.verb === 'up') this.scrollSilent('up');
+        else if (a.verb === 'down') this.scrollSilent('down');
+        else if (a.verb === 'back') { adbShell('input keyevent KEYCODE_BACK'); sleep(500); }
+        else if (a.verb === 'home') { adbShell('input keyevent KEYCODE_HOME'); sleep(500); }
+        console.log(JSON.stringify({ did: a.verb, frame: this._frame() })); return this;
+      }
+      default:
+        console.log(JSON.stringify({ error: `unknown kind ${a.kind}`, frame: this._frame() })); return this;
+    }
+  }
+
+  // clear the currently-focused input. Typing into a non-empty field APPENDS
+  // (scar 2026-06-01: a leftover draft + new text = "test\> here oNoveno…"), so
+  // wipe first. Select-all then delete is the reliable cross-app way (works when
+  // the cursor position is unknown). Assumes the field is already focused.
+  _clearInput() {
+    adbShell('input keycombination 113 29'); // CTRL_LEFT + A → select all
+    sleep(150);
+    adbShell('input keyevent KEYCODE_DEL');   // delete selection
+    sleep(150);
+    return this;
+  }
+
+  // scroll without printing (used inside do())
+  scrollSilent(dir = 'down') {
+    const d = { down: '540 1600 540 600', up: '540 600 540 1600',
+                left: '900 1200 200 1200', right: '200 1200 900 1200' }[dir] || '540 1600 540 600';
+    adbShell(`input swipe ${d} 300`); sleep(700); this._els = [];
+    return this;
+  }
+
   // ---- act by NAME; tool resolves to coords --------------------------------
   // ALWAYS resolve against a FRESH dump. Coordinates move out from under us when
   // the soft keyboard opens/closes (Gmail's Subject shifted ~436px between dumps,
@@ -280,8 +578,28 @@ class Phone {
   // Every action returns {<what it did>, screen:<fresh view>} — act→see folded
   // into ONE call so the model sees the result of its action without a separate
   // `see` (halves the round-trips; the biggest token + reasoning win).
-  _act(result) {
+  // Close the soft keyboard if one is up, so every screen settles to a stable,
+  // keyboard-free layout before we read it. BACK is what reliably dismisses BOTH
+  // the system IME and in-app panels (WhatsApp's emoji tray) — `ime disable`
+  // (kbd off) does neither on real OEM phones (scar 2026-06-01: claimed "off"
+  // while Andy watched the emoji keyboard stay open). Idempotent: only fires
+  // when a keyboard is actually shown, so it never eats a real BACK navigation.
+  // Bonus: dismissing the IME is exactly what makes icon-only buttons that live
+  // behind it (e.g. WhatsApp Send) render and become tappable by name.
+  _dismissKb() {
+    let shown = false;
+    try { shown = /mInputShown=true/.test(adbShell('dumpsys input_method | grep mInputShown || true')); } catch (_) {}
+    if (shown) { adbShell('input keyevent KEYCODE_BACK'); sleep(350); }
+    return this;
+  }
+
+  // keepKb=true skips the keyboard dismiss — used when the action's whole point is
+  // to FOCUS an input (tapping a field), where you want the IME to stay up so the
+  // next type() lands. Every other action closes the keyboard (Andy's rule
+  // 2026-06-01: "every time an instruction executes, it should close keyboard").
+  _act(result, keepKb = false) {
     sleep(300);                 // small settle so the new screen has rendered
+    if (!keepKb) this._dismissKb();   // keyboard off after every action → stable, readable screen
     this._els = [];
     console.log(JSON.stringify({ ...result, screen: this._view() }));
     return this;
@@ -292,7 +610,7 @@ class Phone {
     if (!e) { console.log(JSON.stringify({ error: `no element matching "${name}"`, screen: this._view() })); return this; }
     adbShell(`input tap ${e.bounds.cx} ${e.bounds.cy}`);
     sleep(900);
-    return this._act({ tapped: name });
+    return this._act({ tapped: name }, !!e.editable); // tapping a field → keep keyboard for the next type()
   }
 
   // `input text` is ASYNC on the device — adb returns before the keystrokes land.
@@ -301,8 +619,7 @@ class Phone {
   // until the device stops changing, rather than guessing a fixed sleep. For
   // structured data (contacts, etc.) prefer intent()/addContact() over typing.
   type(text) {
-    const esc = String(text).replace(/(["'\\ ])/g, '\\$1').replace(/ /g, '%s');
-    adbShell(`input text "${esc}"`);
+    if (!typeText(text)) { console.log(JSON.stringify({ error: 'nothing typeable (emoji/non-Latin stripped to empty)', input: String(text) })); return this; }
     this._settle();
     return this._act({ typed: text });
   }
@@ -348,7 +665,13 @@ class Phone {
   // Open an app by PACKAGE via `monkey` — deterministic, no fragile gestures, never
   // depends on an icon being on a visible page. Also the reliable way to RESET
   // position when lost. (scar 2026-05-30: gesture+icon-tap got lost in the shade.)
-  open(app) {
+  // open an app. `fresh:true` = SECURE START POINT (Andy 2026-06-02: "workflows
+  // should start from some secure point — reset to main menu, then open the app").
+  // A macro can't assume where the phone is; replaying from a random screen is how
+  // `ui tap Andres` opened ContactInfo instead of the chat. `fresh` force-stops the
+  // app + goes home first, so it ALWAYS launches at its main screen — a determin-
+  // istic anchor every macro can rely on as step 1.
+  open(app, { fresh = false } = {}) {
     // "home" has no launchable activity — it's the HOME key.
     if (/^home$/i.test(String(app).trim())) {
       this.home(); sleep(800);
@@ -361,16 +684,46 @@ class Phone {
       return this;
     }
     try {
+      if (fresh) {
+        try { adbShell(`am force-stop ${pkg}`); } catch (_) {}
+        this.home(); sleep(500);
+      }
       const r = adbShell(`monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
-      sleep(1600); this._els = [];
+      sleep(fresh ? 2200 : 1600); this._els = [];
       if (/No activities found|aborted/i.test(r)) {
         console.log(JSON.stringify({ error: `"${app}" (${pkg}) has no launchable activity` }));
       } else {
-        console.log(JSON.stringify({ opened: app, pkg }));
+        console.log(JSON.stringify({ opened: app, pkg, fresh }));
       }
     } catch (e) {
       console.log(JSON.stringify({ error: `failed to open "${app}": ${e.message || e}` }));
     }
+    return this;
+  }
+
+  // Open an app's Play Store page DETERMINISTICALLY by package, via the
+  // market://details?id= intent — skips searching the store and the SPONSORED-AD
+  // trap entirely (scar 2026-06-02: a Play Store search for "instagram" put a
+  // sponsored TikTok "Install" as the first result; a blind tap installs the wrong
+  // app). Lands the model straight on the right app's page, where `ui do` Install
+  // is unambiguous. `pkg` may be a known store package id, or a friendly name we
+  // map to one. Does NOT auto-tap Install — installing is a deliberate act the
+  // model/human confirms by reading the page first. Returns the frame.
+  store(app) {
+    const KNOWN = {
+      instagram: 'com.instagram.android', tiktok: 'com.zhiliaoapp.musically',
+      whatsapp: 'com.whatsapp', telegram: 'org.telegram.messenger',
+      'x': 'com.twitter.android', twitter: 'com.twitter.android',
+      facebook: 'com.facebook.katana', messenger: 'com.facebook.orca',
+      'pedidos ya': 'com.pedidosya', pedidosya: 'com.pedidosya',
+      rappi: 'com.grability.rappi', spotify: 'com.spotify.music',
+    };
+    const n = String(app).toLowerCase().trim();
+    const pkg = KNOWN[n] || (/^[\w.]+\.[\w.]+$/.test(n) ? n : null); // known, or looks like a package id
+    if (!pkg) { console.log(JSON.stringify({ error: `don't know the package for "${app}" — pass a package id (e.g. com.instagram.android) or add it to KNOWN`, })); return this; }
+    adbShell(`am start -a android.intent.action.VIEW -d 'market://details?id=${pkg}'`);
+    sleep(2500); this._els = [];
+    console.log(JSON.stringify({ store: app, pkg, frame: this._frame() }));
     return this;
   }
 
@@ -421,20 +774,59 @@ class Phone {
     return this;
   }
 
-  // notifications: the phone's nervous signals (cheap, no screenshot)
-  notifications() {
+  // notifications: the phone's nervous signals (cheap, no screenshot). This is the
+  // HEARTBEAT primitive — a cron polls it, recognises the sender, loads the contact,
+  // acts. So each note carries what a heartbeat needs to ROUTE and DEDUPE:
+  //   pkg   full package (com.whatsapp) — route to the right handler. Truncating it
+  //         (old bug) made whatsapp indistinguishable from any "…whatsapp…" pkg.
+  //   app   short alias (whatsapp) for humans/logs.
+  //   title sender name / app — feed to matchBySender() to find the contact.
+  //   text  the message preview.
+  //   when  epoch ms — drop ones older than the last beat (--since).
+  //   key   the notification's stable key — dedupe across beats; dismiss after acting.
+  // `since` (ms) filters to notes newer than a watermark so a heartbeat only ever
+  // sees what's NEW since its last run (no reprocessing the same message every beat).
+  // `apps` (array of pkg substrings, e.g. ['whatsapp','gmail']) keeps ONLY those.
+  // By default OS/OEM boilerplate (setup wizard, USB debug, OTA, system) is dropped
+  // — a heartbeat never acts on "USB debugging connected", and paying ~850 tok/beat
+  // to read 15 system notices is the opposite of token-efficient.
+  notifications(since = 0, apps = null) {
     const out = adbShell('dumpsys notification --noredact');
     const lines = out.split('\n');
     const notes = [];
     let cur = null;
+    const decode = (s) => String(s || '')
+      .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(+n); } catch (_) { return ''; } })
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
     for (const ln of lines) {
       let m;
-      if ((m = ln.match(/pkg=([^\s]+)/))) { if (cur) notes.push(cur); cur = { pkg: shortApp(m[1]) }; }
-      if (cur && (m = ln.match(/android\.title=String \(([^)]*)\)/))) cur.title = m[1];
-      if (cur && (m = ln.match(/android\.text=String \(([^)]*)\)/))) cur.text = (m[1] || '').slice(0, 80);
+      // A NotificationRecord(...) header line carries pkg + key. when/category live
+      // on their OWN lines further down inside the record, so pick those up below.
+      if ((m = ln.match(/NotificationRecord\(.*?pkg=(\S+)/))) {
+        if (cur) notes.push(cur);
+        const pkg = m[1];
+        cur = { pkg, app: shortApp(pkg) };
+        let k; if ((k = ln.match(/\bkey=(\S+?):? /))) cur.key = k[1]; // strip trailing ":"
+        continue;
+      }
+      if (!cur) continue;
+      // when=<ms>/<ms> on its own line — take the first (the post time).
+      if ((m = ln.match(/^\s*when=(\d+)/))) { if (!cur.when) cur.when = +m[1]; continue; }
+      if ((m = ln.match(/^\s*category=([a-z]+)/))) { cur.category = m[1]; continue; }
+      // title/text can be String(...) OR SpannableString(...) — match both.
+      if ((m = ln.match(/android\.title=(?:Spannable)?String \(([\s\S]*?)\)\s*$/))) cur.title = decode(m[1]);
+      else if ((m = ln.match(/android\.text=(?:Spannable)?String \(([\s\S]*?)\)\s*$/))) cur.text = decode(m[1]).slice(0, 120);
     }
     if (cur) notes.push(cur);
-    const slim = notes.filter((n) => n.title || n.text);
+    let slim = notes.filter((n) => n.title || n.text);
+    if (since) slim = slim.filter((n) => (n.when || 0) >= since);
+    if (apps && apps.length) {
+      // explicit allow-list: keep only the apps the caller named
+      slim = slim.filter((n) => apps.some((p) => n.pkg.includes(p)));
+    } else {
+      // default: drop OS/OEM/system noise a heartbeat would never act on
+      slim = slim.filter((n) => !NOTIF_NOISE_PKG.test(n.pkg));
+    }
     console.log(JSON.stringify(slim));
     return this;
   }
@@ -485,13 +877,38 @@ class Phone {
       if (!e) { filled.push({ field: name, error: 'not found' }); continue; }
       adbShell(`input tap ${e.bounds.cx} ${e.bounds.cy}`); // FOCUS the field
       sleep(500);
-      adbShell(`input text "${String(value).replace(/(["'\\ ])/g, '\\$1').replace(/ /g, '%s')}"`);
+      const ok = typeText(value);                           // safe escape + emoji strip
       this._settle();
       this._els = [];                                       // layout shifted
-      filled.push({ field: name, value });
+      filled.push(ok ? { field: name, value } : { field: name, value, note: 'emoji/non-Latin chars stripped' });
     }
+    this._dismissKb();          // keyboard off so the post-fill screen is stable + Send/icon buttons render
+    this._els = [];
     console.log(JSON.stringify({ filled, screen: this._view() }));
     return this;
+  }
+
+  // send: type a message into the composer and fire Send — ATOMICALLY. Sending a
+  // message is ONE intent; making the model fill-then-hunt-for-a-button is the AIX
+  // failure (scar 2026-06-01: fill + immediate `tap Send` raced and the draft
+  // vanished; only worked with a manual settle in between). So we bake the settle
+  // in: focus the composer → type → settle → dismiss keyboard → tap the send
+  // control. `field` is the composer's name (default "Message" — WhatsApp; pass
+  // e.g. "Compose email" or "Type a message" for other apps). `send` is the send
+  // button's label/desc (default "Send"). Verifies the field cleared = it fired.
+  send(text, { field = 'Message', send = 'Send' } = {}) {
+    const f = this._findField(field);
+    if (!f) { console.log(JSON.stringify({ error: `no composer field matching "${field}"`, screen: this._view() })); return this; }
+    adbShell(`input tap ${f.bounds.cx} ${f.bounds.cy}`);  // focus composer
+    sleep(400);
+    if (!typeText(text)) { console.log(JSON.stringify({ error: 'nothing typeable (emoji/non-Latin stripped to empty)', input: String(text) })); return this; }
+    this._settle();                                       // wait for keystrokes to land
+    this._dismissKb();                                    // close kbd → Send control renders + stable layout
+    const s = this._find(send);                           // _find does a fresh dump; Send now surfaced on page 1
+    if (!s) { console.log(JSON.stringify({ error: `typed but no send button matching "${send}"`, typed: text, screen: this._view() })); return this; }
+    adbShell(`input tap ${s.bounds.cx} ${s.bounds.cy}`);
+    sleep(900);
+    return this._act({ sent: text });
   }
 
   // like _find but prefers EditText fields — a form field's "label" is often its
@@ -634,6 +1051,11 @@ class Phone {
 }
 
 // ---- helpers -------------------------------------------------------------
+// packages whose notifications a heartbeat never acts on — OS, OEM bloat, install
+// chatter, system services. Dropped from `notif list` by default (override with
+// `notif list --apps ...`). Keep this conservative: only obvious system noise.
+const NOTIF_NOISE_PKG = /(?:^android$|setupwizard|\.gms|googlequicksearchbox|packageinstaller|com\.android\.vending|\.wellbeing|com\.dti\.motorola|motorola\.ccc|\.systemui|inputmethod|com\.android\.systemui|\.providers\.|com\.google\.android\.apps\.wellbeing)/i;
+
 function coordize(e, withCoords) {
   return withCoords ? { l: e.label || `(${e.cls})`, xy: [e.bounds.cx, e.bounds.cy] }
                     : (e.label || `(${e.cls})`);
@@ -713,7 +1135,24 @@ const ROUTER = {
     log:  () => phone.callLog ? phone.callLog() : out({ error: 'call log: not yet implemented' }),
   },
   notif: {
-    list: () => phone.notifications(),
+    // notif list                      → new+real notifications (system noise dropped)
+    // notif list --since <epochMs>     → only notifications newer than the watermark
+    // notif list <epochMs>             → same (bare number = since)
+    // notif list --apps whatsapp,gmail → ONLY those apps (heartbeat allow-list)
+    // notif list --all                 → include system/OEM noise too
+    list: (a) => {
+      let since = 0, apps = null;
+      if (typeof a === 'number') since = a;
+      else if (a && typeof a === 'object' && !Array.isArray(a)) {
+        if (a.since) since = +a.since;
+        if (a.apps) apps = Array.isArray(a.apps) ? a.apps : String(a.apps).split(',');
+      } else if (typeof a === 'string') {
+        const sm = a.match(/(?:--since\s+)?(\d{10,})/); if (sm) since = +sm[1];
+        const am = a.match(/--apps\s+(\S+)/);           if (am) apps = am[1].split(',').filter(Boolean);
+        if (/--all\b/.test(a)) apps = [''];             // [''] = keep every pkg (defeats noise filter)
+      }
+      return phone.notifications(since, apps);
+    },
   },
   // web: reach the internet DETERMINISTICALLY — don't fumble the address bar.
   //   web open <url>        → load a URL
@@ -734,11 +1173,39 @@ const ROUTER = {
   },
   app: {
     list: () => phone.appList(),
-    open: (a) => phone.open(typeof a === 'string' ? a : (a && a.name)),
+    // app open <name> [--fresh]   — launch (optionally from a clean start point)
+    open: (a) => {
+      if (a && typeof a === 'object') return phone.open(a.name, { fresh: !!a.fresh });
+      const s = String(a || '');
+      const fresh = /--fresh\b/.test(s);
+      return phone.open(s.replace(/--fresh\b/, '').trim(), { fresh });
+    },
+    // app fresh <name>   — SECURE START POINT: force-stop + home + launch. The
+    // canonical first step of a macro so replay is deterministic, never mid-app.
+    fresh: (a) => phone.open(typeof a === 'string' ? a : (a && a.name), { fresh: true }),
+    // app store <name|pkg>  — open the app's Play Store page DIRECTLY (skips search
+    // + the sponsored-ad trap). Then `ui do <Install>`. Doesn't auto-install.
+    store: (a) => phone.store(typeof a === 'string' ? a : (a && a.name)),
     intent: (a) => phone.intent((a && a.action) || a, (a && a.extra) || ''),
   },
   // ---- UI lane: drive the glass (third-party apps with no back door) ----
   ui: {
+    // THE FRAME (app-agnostic AIX): `ui frame` reads the screen as {app, read[], do[]}
+    // with NUMBERED actions; `ui do <n> ["text"]` runs the nth and returns the next
+    // frame. Same gestures drive every app — the model never needs app-specific labels.
+    frame:  () => phone.frame(),
+    f:      () => phone.frame(),
+    do:     (a) => {
+      // accept a NUMBER (interactive) or a VERB (macro, self-healing):
+      //   `1` | `1 "text"` | `send` | `type "hola"` | `back` | {n,text}
+      if (a && typeof a === 'object') return phone.do(a.n, a.text);
+      const s = String(a == null ? '' : a).trim();
+      const m = s.match(/^(\d+|[a-z]+\d*)\s*(?:"([\s\S]*)"|'([\s\S]*)'|([\s\S]*))?$/i);
+      if (!m) return out({ error: 'usage: ui do <n|verb> ["text"]   (verbs: type type2 send up down back home more)' });
+      const n = m[1];
+      const arg = m[2] != null ? m[2] : (m[3] != null ? m[3] : (m[4] || '')).trim();
+      return phone.do(n, arg);
+    },
     see:    (a) => phone.see(typeof a === 'object' ? a : (typeof a === 'string' && /^\d+$/.test(a) ? { page: parseInt(a, 10) } : {})),
     more:   () => phone.more(),
     tap:    (a) => phone.tap(typeof a === 'string' ? a : (a && a.label)),
@@ -746,6 +1213,12 @@ const ROUTER = {
     key:    (a) => phone.key(typeof a === 'string' ? a : (a && a.key)),
     scroll: (a) => phone.scroll(typeof a === 'string' ? a : (a && a.dir) || 'down'),
     fill:   (a) => phone.fill(a || {}),
+    // ui send "<text>"  → type into the composer + Send, atomically (default
+    //   field "Message", button "Send"). For other apps:
+    //   ui send '{"text":"hi","field":"Compose email","send":"Send"}'
+    send:   (a) => typeof a === 'string'
+                   ? phone.send(a)
+                   : phone.send((a && a.text) || '', a || {}),
     shot:   (a) => phone.shot(typeof a === 'string' ? a : undefined),
     back:   () => phone.back(),
     home:   () => phone.home(),
@@ -772,16 +1245,28 @@ const ROUTER = {
       out({ saved: name, steps });
     },
     del: (a) => { const n = typeof a === 'string' ? a : a && a.name; const w = loadWorkflows(); if (!w[n]) return out({ error: `no workflow "${n}"` }); delete w[n]; saveWorkflows(w); out({ deleted: n }); },
+    // workflow run <name> [arg1] [arg2] …  — replay a saved macro, substituting
+    // $1,$2,… (and $* = all args joined) in each step. THIS is how app-specific
+    // ergonomics live OUTSIDE the agnostic core (Andy 2026-06-02: "the navigation
+    // is app-agnostic, that's why we have workflows — macros for specific apps").
+    // e.g.  workflow add wa-send '["app open whatsapp","ui tap $1","ui do 1 \"$2\"","ui do 2"]'
+    //       workflow run wa-send Andres "hola que tal"
     run: (a) => {
-      const n = typeof a === 'string' ? a : a && a.name;
+      let n, args = [];
+      if (a && typeof a === 'object' && !Array.isArray(a)) { n = a.name; args = a.args || []; }
+      else if (typeof a === 'string') { const t = tokenize(a); n = t[0]; args = t.slice(1); }
       const w = loadWorkflows();
       if (!w[n]) return out({ error: `no workflow "${n}"`, available: Object.keys(w) });
+      const subst = (s) => String(s)
+        .replace(/\$\*/g, args.join(' '))
+        .replace(/\$(\d+)/g, (_, i) => args[(+i) - 1] != null ? args[(+i) - 1] : '');
       const results = [];
-      for (const step of w[n]) {
+      for (const raw of w[n]) {
+        const step = subst(raw);
         const captured = capture(() => dispatch(tokenize(step)));
         results.push({ step, result: tryParse(captured) });
       }
-      out({ workflow: n, results });
+      out({ workflow: n, args, results });
     },
   },
   // ---- meta ----
@@ -880,6 +1365,13 @@ function dispatch(argv) {
   if (typeof node === 'function') return node(parseArg(verb)); // meta nouns: devices/doctor
   const fn = node[verb];
   if (!fn) return out({ error: `unknown verb "${verb}" for "${noun}"`, available: Object.keys(node) });
+  // `workflow run <name> <arg> <arg…>` needs args kept SEPARATE — a quoted
+  // multi-word message must stay one arg ($2), not get re-flattened+re-split
+  // (scar 2026-06-02: "long msg" shattered into $2,$3,$4…). Pass {name,args} so
+  // the shell's argv grouping survives intact.
+  if (noun === 'workflow' && verb === 'run' && rest.length) {
+    return fn({ name: rest[0], args: rest.slice(1) });
+  }
   return fn(parseArg(rest.join(' ')));
 }
 
