@@ -342,7 +342,11 @@ class Phone {
   _classify() {
     const inputs = [], submits = [], opens = [], overflow = [], content = [];
     let scroll = false;
-    const SUBMIT_RE = /^(send|submit|post|reply|publish|share|search|go|done|next|confirm|ok)\b/i;
+    // Submit/action controls. Also match the common ES/PT labels (Enviar, Mandar,
+    // Publicar…) — WhatsApp's send button is "Enviar" on a Spanish phone, so an
+    // English-only list left `do send` blind on non-English devices (it fell back
+    // to Enter, which just inserts a newline). Same intents, more locales.
+    const SUBMIT_RE = /^(send|enviar|mandar|submit|post|publicar|reply|responder|publish|share|compartir|compartilhar|search|buscar|pesquisar|go|ir|done|listo|hecho|concluir|feito|next|siguiente|proximo|próximo|confirm|confirmar|ok)\b/i;
     const MORE_RE = /^(more options|more|overflow|⋮|options menu|see more)$/i;
     // these are NAV/status/content masquerading as tappable rows — already covered
     // by a core verb (back/home) or they're really read-only chrome (a timestamp,
