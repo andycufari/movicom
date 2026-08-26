@@ -1,0 +1,32 @@
+{
+  "name": "movicom-mcp",
+  "version": "0.1.0",
+  "description": "MCP stdio server exposing semantic Android tools backed by Movicom",
+  "type": "module",
+  "bin": {
+    "movicom-mcp": "src/server.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:smoke": "node smoke/real-device.js"
+  },
+  "keywords": [
+    "mcp",
+    "android",
+    "adb",
+    "movicom",
+    "agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}
