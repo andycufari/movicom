@@ -129,6 +129,21 @@ movicom camera shot '{"pull":true}'  # take a real photo, copy it to the compute
 Every `ui do` returns the next **frame**, so the model never needs a separate read
 between actions — read, pick a number, see what changed.
 
+## MCP
+
+Use Movicom as **native tools** from Codex, Claude Code, OpenCode, APX, and any other
+MCP client. An optional [`movicom-mcp`](mcp/) stdio server exposes semantic Android
+tools (`android_status`, `android_screen`, `android_action`, …) as a thin layer over the
+CLI — the driver stays `movicom`, dependency-free.
+
+```bash
+npm install -g movicom-mcp
+```
+
+See **[docs/MCP.md](docs/MCP.md)** for the tools, client configuration, safety, and
+tests, and the [`android-control`](skills/android-control/SKILL.md) skill that teaches an
+agent to drive Android through them.
+
 ## Configuring the phone
 
 See **[HOWTO.md](HOWTO.md)** for the full setup: install `adb` + movicom (Mac &

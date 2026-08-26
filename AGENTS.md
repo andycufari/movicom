@@ -10,6 +10,14 @@ This is your operating manual.
 sms, calendar, settings) have direct commands — use them. Drive the screen
 (`ui ...`) only for third-party apps with no back door.
 
+## Using the MCP tools instead
+
+If your host exposes the **`movicom-mcp`** server, prefer its `android_*` tools
+(`android_status`, `android_screen`, `android_action`, …) over shell commands. They wrap
+the exact commands below, so everything in this manual still applies — `android_screen`
+*is* `ui frame`, `android_action` *is* `ui do`. Reach for a raw `movicom` shell command
+only when there is no MCP client, or to debug. See [docs/MCP.md](docs/MCP.md).
+
 ## Command shape
 
 ```
